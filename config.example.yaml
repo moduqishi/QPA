@@ -1,0 +1,23 @@
+server:
+  host: 0.0.0.0
+  port: 8963
+
+accounts:
+  - name: main
+    pat: pt-YOUR_PAT_TOKEN_HERE
+    enabled: true
+  - name: backup
+    pat: pt-YOUR_BACKUP_PAT_HERE
+    enabled: false
+
+strategy: fill  # round_robin | fill
+
+models:
+  default_context_length: 1000000
+  list:
+    - id: lite
+      display_name: Lite
+      owned_by: qoder
+    - id: qmodel_latest
+      display_name: Qwen3.7-Max
+      owned_by: qoder
