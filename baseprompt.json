@@ -51,7 +51,13 @@
     "api_key": "",
     "url": "",
     "source": "system",
-    "max_input_tokens": 180000
+    "max_input_tokens": 900000,
+    "context_config": {
+      "1M": {"token_count": 1000000, "is_default": true},
+      "200K": {"token_count": 200000},
+      "400K": {"token_count": 400000},
+      "900K": {"token_count": 900000}
+    }
   },
   "messages": [],
   "tools": [],
