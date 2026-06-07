@@ -322,7 +322,6 @@ def _get_tool_desc(incoming_tools: list | None) -> str:
     tool_desc = (
         "\n[TOOLS]\n"
         + "\n".join(lines) + "\n"
-        + 'Call via: Tool calls:\n```json\n[{"id": "call_...", "type": "function", "function": {"name": "TOOL_NAME", "arguments": "{...}"}}]\n```\n'
     )
     _TOOL_DESC_CACHE = tool_desc
     return tool_desc
@@ -404,13 +403,7 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
     if not rebuilt and prompt.strip():
         rebuilt.append(_build_user_message(prompt))
 
-    # ---- Ensure tool descriptions are in system prompt ----
-    if tools_enabled and rebuilt and rebuilt[0].get("role") == "system":
-        existing = rebuilt[0].get("content", "")
-        if "[TOOLS]" not in existing and "[AVAILABLE TOOLS]" not in existing:
-            tool_text = _get_tool_desc(incoming_tools)
-            if tool_text:
-                rebuilt[0]["content"] = existing + "\n\n" + tool_text
+
 
     # ---- Truncate long conversations ----
     # Keep: first system message + FIRST user message (the task) + last 5 non-system messages
@@ -659,26 +652,18 @@ async def chat_completions(request: Request):
     if image_urls:
         ctx["imageUrls"] = image_urls
 
-    # chatPrompt AND chat_prompt: Qoder system-level instruction fields.
-    # Set to the system prompt from messages[0] (already enriched with tool
-    # descriptions by _build_qoder_messages). If no system message exists,
-    # use CODEX_SYSTEM_PROMPT + tool descriptions as fallback.
-    # This ensures the model sees tool-use instructions regardless of which
-    # Qoder field it uses as primary input.
-    sys_prompt = ""
-    sys_msgs = [m for m in body.get("messages", []) if m.get("role") == "system"]
-    if sys_msgs:
-        sys_prompt = sys_msgs[0].get("content", "")
-    if not sys_prompt and tools_enabled:
-        sys_prompt = CODEX_SYSTEM_PROMPT
-        tool_text = _get_tool_desc(incoming_tools)
-        if tool_text:
-            sys_prompt += "\n\n" + tool_text
-    if sys_prompt:
-        ctx["chatPrompt"] = sys_prompt
+    # chatPrompt: Brief Qoder-level behavioral instruction.
+    # The full system prompt lives in messages[]; tool definitions in tools[].
+    # chatPrompt is a short reminder, NOT the full prompt.
+    if tools_enabled:
+        ctx["chatPrompt"] = (
+            "You are a coding assistant. Use tools when you need information "
+            "or want to make changes. When a step is done, respond to the user."
+        )
     else:
         ctx["chatPrompt"] = ""
-    body["chat_prompt"] = ctx["chatPrompt"]
+    # chat_prompt (top-level): Keep minimal for compatibility.
+    body["chat_prompt"] = ""
 
     if tools_enabled:
         body["tools"] = copy.deepcopy(incoming_tools)
