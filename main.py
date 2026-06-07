@@ -239,9 +239,22 @@ def _convert_openai_contents_to_qoder(message: dict) -> dict:
     return message
 
 
+TOOL_INSTRUCTION = (
+    "You have tools available. When the user asks you to do something - read files, write code, "
+    "run commands, modify projects - you MUST use the tools to actually do it. "
+    "Do NOT just describe what you would do. Do NOT output a plan without executing steps. "
+    "Call the appropriate tool directly instead of narrating your intent. "
+    "After each tool result, decide the next action and take it immediately."
+)
+
 def _build_qoder_messages(template_messages: list, incoming_messages: list[dict],
                           prompt: str, tools_enabled: bool, image_urls: list[str]) -> list[dict]:
     rebuilt: list[dict] = []
+    # Inject a tool-use primer as the first system message when tools are available.
+    # This is separate from Codex's own system prompt and tells Qwen-adapted models
+    # to call tools instead of narrating intent.
+    if tools_enabled:
+        rebuilt.append({"role": "system", "content": TOOL_INSTRUCTION})
     keep_sys = not _has_role(incoming_messages, "system")
     if keep_sys:
         for msg in template_messages:
