@@ -26,11 +26,6 @@ QODER_CHAT_URL = (
     "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
 )
 
-# ── SSE keepalive interval (seconds) ──────────────────────────────────
-# Ensures the connection stays alive through proxies even when the
-# upstream model is silently reasoning for a long time.
-_SSE_KEEPALIVE_INTERVAL = 25
-
 
 @app.on_event("startup")
 async def startup():
@@ -297,10 +292,9 @@ def _extract_delta(data_line: str) -> dict:
             delta = ch.get("delta", {})
             role = delta.get("role", "")
             content = delta.get("content", "")
-            reasoning = delta.get("reasoning_content", "")
             tc = delta.get("tool_calls")
-            if role or content or reasoning or (tc and len(tc) > 0):
-                return {"role": role, "content": content, "reasoning_content": reasoning, "tool_calls": tc}
+            if role or content or (tc and len(tc) > 0):
+                return {"role": role, "content": content, "tool_calls": tc}
     except: pass
     return {}
 
@@ -309,14 +303,13 @@ def _make_chunk(req_id: str, created: int, model: str) -> dict:
     return {"id": req_id, "object": "chat.completion.chunk", "created": created, "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": None}]}
 
-
 def _sse_line(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def _sse_keepalive() -> str:
-    """SSE comment line — keeps the connection alive through proxies."""
-    return ": keepalive\n\n"
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token for Chinese, ~6 for mixed."""
+    return max(1, len(text) // 4)
 
 
 class ToolCallAccumulator:
@@ -336,20 +329,10 @@ class ToolCallAccumulator:
     def snapshot(self) -> list[dict]: return copy.deepcopy(self.calls)
 
 
-async def _heartbeat_wrap(async_iter, interval: float = _SSE_KEEPALIVE_INTERVAL):
-    """Wrap an async iterator, yielding ``None`` on heartbeat timeout.
-
-    The consumer sends a keepalive comment whenever ``None`` is yielded.
-    """
-    it = async_iter.__aiter__()
-    while True:
-        try:
-            item = await asyncio.wait_for(it.__anext__(), timeout=interval)
-            yield item
-        except asyncio.TimeoutError:
-            yield None
-        except StopAsyncIteration:
-            break
+def _build_usage(prompt_text: str, completion_text: str) -> dict:
+    pt = _estimate_tokens(prompt_text)
+    ct = _estimate_tokens(completion_text)
+    return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
 
 
 # ─── API Endpoints ───
@@ -400,8 +383,19 @@ async def chat_completions(request: Request):
     if image_urls:
         mc["is_vl"] = True
 
+    # Forward key OpenAI parameters to Qoder config
+    forwarded_params = {}
+    for p in ("temperature", "top_p", "max_tokens"):
+        if p in req:
+            forwarded_params[p] = req[p]
+    if forwarded_params:
+        mc.update(forwarded_params)
+
     params = body.get("parameters", {})
     params["context_length"] = pool.default_context_length
+    # Forward tool_choice if provided
+    if "tool_choice" in req:
+        params["tool_choice"] = req["tool_choice"]
 
     biz = body.get("business", {})
     biz["id"] = str(uuid.uuid4())
@@ -429,10 +423,10 @@ async def chat_completions(request: Request):
 
     if stream:
         return StreamingResponse(
-            _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled),
+            _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt),
             media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
     else:
-        return await _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled)
+        return await _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt)
 
 
 def _load_template() -> dict:
@@ -447,16 +441,18 @@ def _load_template() -> dict:
     raise FileNotFoundError("baseprompt.json not found")
 
 
-# Template will be cached after startup
-
-
-async def _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled):
-    """Async SSE streaming response with keepalive and error resilience."""
+async def _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt):
+    """Async SSE streaming response with error resilience.
+    
+    NOTE: reasoning_content is intentionally NOT forwarded to avoid 
+    confusing downstream clients (Codex may not handle this non-standard field).
+    """
     tc_acc = ToolCallAccumulator()
     pending_content = ""
     pending_role = "assistant"
     emitted_chunk = False
     streaming_text = False
+    full_content = ""
 
     def _is_potential_tc_text(text: str) -> bool:
         candidate = text.lstrip()
@@ -471,28 +467,21 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
             indexed.append(c)
         return indexed
 
-    def _emit_chunk(content=None, role=None, tc=None, reasoning=None):
+    def _emit_chunk(content=None, role=None, tc=None):
         chunk = _make_chunk(req_id, created, model)
         delta = chunk["choices"][0]["delta"]
         if role: delta["role"] = role
         if content: delta["content"] = content
-        if reasoning: delta["reasoning_content"] = reasoning
         if tc: delta["tool_calls"] = tc
         return _sse_line(chunk)
 
     try:
-        async for raw_item in _heartbeat_wrap(open_stream(sess, QODER_CHAT_URL, body, extra_headers)):
-            # Heartbeat — keep connection alive
-            if raw_item is None:
-                yield _sse_keepalive()
-                continue
-
-            line = raw_item
+        async for line in open_stream(sess, QODER_CHAT_URL, body, extra_headers):
             if not line.startswith("data:"): continue
             delta = _extract_delta(line[5:].strip())
             if not delta: continue
 
-            d_role, d_content, d_reasoning = delta.get("role", ""), delta.get("content", ""), delta.get("reasoning_content", "")
+            d_role, d_content = delta.get("role", ""), delta.get("content", "")
             d_tc = delta.get("tool_calls")
 
             if d_role: pending_role = d_role
@@ -508,14 +497,10 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
                 emitted_chunk = True
                 continue
 
-            if d_reasoning:
-                yield _emit_chunk(role=pending_role if not emitted_chunk else None, reasoning=d_reasoning)
-                emitted_chunk = True
-                continue
-
             if not d_content: continue
             if not tools_enabled or streaming_text:
                 streaming_text = True
+                full_content += d_content
                 yield _emit_chunk(content=d_content, role=pending_role if not emitted_chunk else None)
                 emitted_chunk = True
                 continue
@@ -523,17 +508,16 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
             pending_content += d_content
             if _is_potential_tc_text(pending_content): continue
             streaming_text = True
+            full_content += pending_content
             yield _emit_chunk(content=pending_content, role=pending_role if not emitted_chunk else None)
             emitted_chunk = True
             pending_content = ""
 
     except Exception as exc:
-        # Graceful upstream error — send a final chunk so the client
-        # doesn't see a hanging / truncated connection.
         err_msg = str(exc)[:200]
-        # Flush any buffered content first
         if pending_content:
             yield _emit_chunk(content=pending_content)
+            full_content += pending_content
             pending_content = ""
         final = _make_chunk(req_id, created, model)
         final["choices"][0]["finish_reason"] = "error"
@@ -544,6 +528,7 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
 
     # ---- normal stream end ----
     if pending_content:
+        full_content += pending_content
         parsed_tc = tools_enabled and _parse_tool_calls_text(pending_content)
         if parsed_tc:
             tc_acc.append(parsed_tc)
@@ -559,10 +544,9 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
     yield "data: [DONE]\n\n"
 
 
-async def _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled):
+async def _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt):
     """Non-streaming variant — consumes the full async stream then returns JSON."""
     full_text = ""
-    reasoning_text = ""
     tc_acc = ToolCallAccumulator()
 
     try:
@@ -571,11 +555,9 @@ async def _non_stream_response(sess, body, extra_headers, req_id, created, model
             delta = _extract_delta(line[5:].strip())
             if not delta: continue
             if delta.get("content"): full_text += delta["content"]
-            if delta.get("reasoning_content"): reasoning_text += delta["reasoning_content"]
             if delta.get("tool_calls") and len(delta["tool_calls"]) > 0: tc_acc.append(delta["tool_calls"])
     except Exception as exc:
-        # Graceful fallback: return what we have so far
-        err_msg = str(exc)[:200]
+        pass  # Gracefully return whatever we have
 
     fallback_tc = None
     if tc_acc.is_empty() and tools_enabled: fallback_tc = _parse_tool_calls_text(full_text)
@@ -584,13 +566,13 @@ async def _non_stream_response(sess, body, extra_headers, req_id, created, model
     if fallback_tc: msg["content"] = None; msg["tool_calls"] = fallback_tc
     elif not full_text and not tc_acc.is_empty(): msg["content"] = None
     else: msg["content"] = full_text
-    if reasoning_text: msg["reasoning_content"] = reasoning_text
     if not tc_acc.is_empty(): msg["tool_calls"] = tc_acc.snapshot()
 
     finish_reason = "tool_calls" if (not tc_acc.is_empty() or fallback_tc) else "stop"
+    usage = _build_usage(prompt, full_text)
     return JSONResponse({"id": req_id, "object": "chat.completion", "created": created, "model": model,
                           "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
-                          "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
+                          "usage": usage})
 
 
 # ─── Admin API ───
