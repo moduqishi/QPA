@@ -322,7 +322,7 @@ def _get_tool_desc(incoming_tools: list | None) -> str:
     tool_desc = (
         "\n[TOOLS]\n"
         + "\n".join(lines) + "\n"
-        + 'Call via: Tool calls:\n```json\n[{"id": "call_...", "type": "function", "function": {"name": "TOOL_NAME", "arguments": "{...}"}}]\n```\n'
+        + "Use tools to do work and respond to the user."
     )
     _TOOL_DESC_CACHE = tool_desc
     return tool_desc
@@ -404,23 +404,13 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
     if not rebuilt and prompt.strip():
         rebuilt.append(_build_user_message(prompt))
 
-    # ---- Inject tool descriptions into the LAST user message ----
-    if tools_enabled and len(rebuilt) >= 2:
-        tool_text = _get_tool_desc(incoming_tools)
-        if tool_text:
-            for j in range(len(rebuilt) - 1, -1, -1):
-                if rebuilt[j].get("role") == "user":
-                    existing = rebuilt[j].get("content", "")
-                    if "[TOOLS]" not in existing and "[AVAILABLE TOOLS]" not in existing:
-                        enriched = existing + "\n\n" + tool_text
-                        rebuilt[j]["content"] = enriched
-                        contents = rebuilt[j].get("contents")
-                        if isinstance(contents, list):
-                            for c in contents:
-                                if isinstance(c, dict) and c.get("type") == "text":
-                                    c["text"] = enriched
-                                    break
-                    break
+    # ---- Ensure tool descriptions are in system prompt ----
+    if tools_enabled and rebuilt and rebuilt[0].get("role") == "system":
+        existing = rebuilt[0].get("content", "")
+        if "[TOOLS]" not in existing and "[AVAILABLE TOOLS]" not in existing:
+            tool_text = _get_tool_desc(incoming_tools)
+            if tool_text:
+                rebuilt[0]["content"] = existing + "\n\n" + tool_text
 
     # ---- Truncate long conversations ----
     # Keep: first system message + FIRST user message (the task) + last 5 non-system messages
