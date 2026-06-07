@@ -404,6 +404,23 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
         rebuilt.append(_build_user_message(prompt))
 
 
+    # ---- Inject tool descriptions into the LAST user message ----
+    if tools_enabled and len(rebuilt) >= 2:
+        tool_text = _get_tool_desc(incoming_tools)
+        if tool_text:
+            for j in range(len(rebuilt) - 1, -1, -1):
+                if rebuilt[j].get("role") == "user":
+                    existing = rebuilt[j].get("content", "")
+                    if "[TOOLS]" not in existing:
+                        enriched = existing + "\n\n" + tool_text
+                        rebuilt[j]["content"] = enriched
+                        cts = rebuilt[j].get("contents")
+                        if isinstance(cts, list):
+                            for c in cts:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    c["text"] = enriched
+                                    break
+                    break
 
     # ---- Truncate long conversations ----
     # Keep: first system message + FIRST user message (the task) + last 5 non-system messages
@@ -638,14 +655,25 @@ async def chat_completions(request: Request):
 
     # Build the messages array first
     body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls, incoming_tools)
-    # chat_context.text: Set to latest user prompt (current instruction).
-    # This is what Qoder likely feeds as the primary model input.
-    # System prompt, tool descriptions, and conversation history are in messages[]
-    chat_context_text = prompt or ""
+    # chat_context.text: Qoder likely uses this as the primary model input.
+    # Set to system prompt + tool listing + current user prompt.
+    ctx_text = prompt or ""
+    if tools_enabled:
+        for msg in body.get("messages", []):
+            if msg.get("role") == "system":
+                ctx_text = msg.get("content", "")
+                break
+        if not ctx_text:
+            ctx_text = CODEX_SYSTEM_PROMPT
+        tt = _get_tool_desc(incoming_tools)
+        if tt and "[TOOLS]" not in ctx_text:
+            ctx_text += "\n\n" + tt
+        if prompt:
+            ctx_text += "\n\nCurrent task: " + prompt
     if isinstance(ctx.get("text"), dict):
-        ctx["text"]["text"] = chat_context_text
+        ctx["text"]["text"] = ctx_text
     if isinstance(extra.get("originalContent"), dict):
-        extra["originalContent"]["text"] = chat_context_text
+        extra["originalContent"]["text"] = ctx_text
 
     biz["name"] = prompt[:30] if len(prompt) > 30 else prompt
 
