@@ -356,6 +356,13 @@ async def chat_completions(request: Request):
         req = await request.json()
     except:
         return JSONResponse({"error": {"message": "Invalid JSON", "type": "qoder_error"}}, status_code=400)
+    # Log top-level keys of the incoming request
+    req_keys = list(req.keys())
+    extra_info = {}
+    for k in ("tool_choice", "parallel_tool_calls", "stream_options", "metadata", "response_format", "user"):
+        if k in req:
+            extra_info[k] = req[k]
+    logger.info("Request keys=%s extras=%s", req_keys, extra_info)
 
     account = pool.get_account()
     if not account or not account.session:
@@ -369,8 +376,14 @@ async def chat_completions(request: Request):
 
     n_msgs = len(messages)
     tools_list = req.get("tools")
-    logger.info("POST model=%s msgs=%d tools=%d stream=%s",
-                model, n_msgs, len(tools_list) if tools_list else 0, stream)
+    # Log the request detail
+    has_tool_choice = "tool_choice" in req
+    tc_val = req.get("tool_choice") if has_tool_choice else "-"
+    has_parallel = "parallel_tool_calls" in req
+    has_temperature = "temperature" in req
+    logger.info("POST model=%s msgs=%d tools=%d stream=%s tool_choice=%s parallel=%s temp=%s",
+                model, n_msgs, len(tools_list) if tools_list else 0, stream,
+                tc_val, has_parallel, has_temperature)
 
     processed_messages, image_urls = await _process_images(sess, messages)
 
