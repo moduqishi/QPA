@@ -130,9 +130,8 @@ class PatPool:
             account.is_expired = False
             # First quota fetch (may fail if session is too fresh)
             self.refresh_quota(account)
-            # Warm up the inference session so the first real request doesn't
-            # trigger a Qoder cold-start / 503.
-            _warmup_session(sess)
+            # Warmup skipped — HTTP 500 from Qoder; not needed for session init.
+            pass
             return True
         except Exception as e:
             print(f"[pool] init failed for '{account.name}': {e}")
@@ -370,7 +369,7 @@ def _warmup_session(sess: SessionContext):
 
         payload_b64 = build_payload_b64(sess.info)
         date = str(int(time.time()))
-        sig = sign_request(payload_b64, sess.cosy_key, date, body.decode("latin-1"), path_sig)
+        sig = sign_request(payload_b64, sess.cosy_key, date, body, path_sig)
         bearer = compose_bearer(payload_b64, sig)
 
         headers = {

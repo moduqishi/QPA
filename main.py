@@ -563,9 +563,14 @@ async def list_models():
 async def chat_completions(request: Request):
     t0 = time.time()
     try:
-        req = await request.json()
-    except:
-        return JSONResponse({"error": {"message": "Invalid JSON", "type": "qoder_error"}}, status_code=400)
+        try:
+            req = await request.json()
+        except:
+            return JSONResponse({"error": {"message": "Invalid JSON", "type": "qoder_error"}}, status_code=400)
+    except Exception as _crash:
+        import traceback
+        logger.critical("UNHANDLED CRASH in chat_completions: %s\n%s", _crash, traceback.format_exc())
+        return JSONResponse({"error": {"message": f"Internal error: {_crash}", "type": "qoder_crash"}}, status_code=500)
     # Log top-level keys of the incoming request
     req_keys = list(req.keys())
     extra_info = {}
