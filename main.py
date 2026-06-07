@@ -452,14 +452,18 @@ def _load_template() -> dict:
 
 
 async def _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, include_usage, t0):
-    """Async SSE streaming response."""
+    """Async SSE streaming response.
+
+    Retryable upstream disconnects are handled transparently inside
+    ``open_stream()`` — from this function's perspective there's just
+    a single stream that may raise on non-recoverable errors.
+    """
     tc_acc = ToolCallAccumulator()
     pending_content = ""
     pending_role = "assistant"
     emitted_chunk = False
     streaming_text = False
     full_content = ""
-    truncated = False
 
     def _is_potential_tc_text(text: str) -> bool:
         candidate = text.lstrip()
@@ -530,42 +534,35 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
         logger.info("Stream cancelled (req=%s)", req_id)
         return
     except Exception as exc:
-        err_type = type(exc).__name__
         err_msg = str(exc)[:200]
-        # Check if this is an upstream disconnect (Qoder server dropped connection)
         is_disconnect = "peer closed connection" in err_msg or "incomplete chunked" in err_msg
         if is_disconnect:
-            logger.warning("Qoder upstream DISCONNECTED after %.1fs for req=%s: %s",
-                          time.time() - t0, req_id, err_msg)
+            logger.warning("Qoder DISCONNECTED after %.1fs for req=%s: %s",
+                           time.time() - t0, req_id, err_msg)
         else:
             logger.error("Stream error (req=%s): %s", req_id, err_msg, exc_info=True)
 
-        truncated = is_disconnect
-
-        # Flush any content we buffered
         if pending_content:
             if not (tools_enabled and _is_potential_tc_text(pending_content)):
                 yield _emit_chunk(content=pending_content)
                 full_content += pending_content
             pending_content = ""
 
-        finish_reason = "stop"
         final = _make_chunk(req_id, created, model)
-        final["choices"][0]["finish_reason"] = finish_reason
+        final["choices"][0]["finish_reason"] = "stop"
         final["choices"][0]["delta"] = {}
         yield _sse_line(final)
         if include_usage:
             yield _usage_chunk(req_id, created, model, _build_usage(prompt, full_content))
         yield "data: [DONE]\n\n"
 
-        # Log the partial content for debugging
+        tag = "DISCONNECT" if is_disconnect else "ERR"
         content_preview = full_content[-200:].replace("\n", "\\n") if full_content else "(none)"
-        logger.info("Stream TRUNCATED req=%s finish=%s tokens=%d elapsed=%.1fs last_chars=%s",
-                    req_id, finish_reason, _estimate_tokens(full_content),
-                    time.time() - t0, content_preview)
+        logger.info("Stream %s req=%s tokens=%d elapsed=%.1fs content=%s",
+                    tag, req_id, _estimate_tokens(full_content), time.time() - t0, content_preview)
         return
 
-    # ---- Normal completion ----
+    # ---- Normal end of stream ----
     if pending_content:
         full_content += pending_content
         parsed_tc = tools_enabled and _parse_tool_calls_text(pending_content)
@@ -606,11 +603,10 @@ async def _non_stream_response(sess, body, extra_headers, req_id, created, model
         logger.info("Non-stream cancelled (req=%s)", req_id)
         return JSONResponse(None, status_code=499)
     except Exception as exc:
-        err_type = type(exc).__name__
         err_msg = str(exc)[:200]
         is_disconnect = "peer closed connection" in err_msg or "incomplete chunked" in err_msg
         if is_disconnect:
-            logger.warning("Qoder upstream DISCONNECTED (non-stream) for req=%s: %s", req_id, err_msg)
+            logger.warning("Qoder DISCONNECTED (non-stream) for req=%s: %s", req_id, err_msg)
         else:
             logger.error("Non-stream error (req=%s): %s", req_id, err_msg, exc_info=True)
         errored = True
@@ -737,7 +733,7 @@ header .subtitle{color:var(--text2);font-size:13px;margin-top:2px}
 .account-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
 .account-name{font-size:16px;font-weight:600;display:flex;align-items:center;gap:10px}
 .account-actions{display:flex;gap:8px}
-.btn-icon{width:32px;height:32px;border:1px solid var(--border);background:transparent;color:var(--text2);border-radius:8px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s;font-size:14px}
+.btn-icon{width:32px;height:32px;border:1px solid var(--border);background:transparent;color:var(--text2);border-radius:8px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s}
 .btn-icon:hover{border-color:var(--accent);color:var(--text);background:var(--surface2)}
 .btn-icon.danger:hover{border-color:var(--red);color:var(--red)}
 .account-info{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px}

@@ -129,6 +129,13 @@ def _sign_and_auth(
     return bearer, date, sig
 
 
+def _is_retryable_disconnect(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    pats = ("peer closed connection", "incomplete chunked read", "connection reset",
+            "broken pipe", "remote protocol error")
+    return any(p in msg for p in pats)
+
+
 async def open_stream(
     sess: SessionContext,
     url: str,
@@ -137,13 +144,12 @@ async def open_stream(
 ):
     """Async SSE stream — yields raw lines from the Qoder API.
 
-    Uses httpx.AsyncClient with no read timeout so long-reasoning
-    tasks are not cut off prematurely.
+    Transparently retries **once** on retryable upstream disconnects
+    (peer closed connection, incomplete chunked read) so that brief
+    Qoder infrastructure hiccups don't propagate to the caller.
 
-    May raise:
-      RuntimeError — on non-200 HTTP status
-      httpx.RemoteProtocolError — upstream disconnected mid-stream
-      httpx.ReadError — other transport errors
+    ``httpx.AsyncClient`` uses no read timeout so long-reasoning tasks
+    (5+ minutes) are not cut off prematurely.
     """
     body = qoder_encode(json.dumps(body_obj).encode())
     bearer, cosy_date, _ = _sign_and_auth(sess, url, body)
@@ -152,24 +158,45 @@ async def open_stream(
     headers["authorization"] = bearer
     headers["cosy-date"] = cosy_date
 
-    # read=None: never timeout waiting for the upstream model
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=30, read=None, write=30, pool=30),
-        limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
-    ) as client:
-        async with client.stream(
-            "POST", url, content=body, headers=headers
-        ) as resp:
-            if resp.status_code != 200:
-                err = await resp.aread()
-                msg = f"Qoder HTTP {resp.status_code} body={err.decode()}"
-                logger.error(msg)
-                raise RuntimeError(msg)
+    max_retries = 2  # first attempt + 1 retry
+    last_exc = None
 
-            line_count = 0
-            async for line in resp.aiter_lines():
-                if line:
-                    line_count += 1
-                    yield line
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=30, read=None, write=30, pool=30),
+                limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
+            ) as client:
+                async with client.stream(
+                    "POST", url, content=body, headers=headers
+                ) as resp:
+                    if resp.status_code != 200:
+                        err_body = await resp.aread()
+                        msg = f"Qoder HTTP {resp.status_code} body={err_body.decode()}"
+                        logger.error(msg)
+                        raise RuntimeError(msg)
 
-            logger.debug("Qoder stream done: %d lines", line_count)
+                    line_count = 0
+                    async for line in resp.aiter_lines():
+                        if line:
+                            line_count += 1
+                            yield line
+
+                    logger.debug("Qoder stream done: %d lines (attempt %d)", line_count, attempt)
+            return  # success — normal exit
+
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries and _is_retryable_disconnect(exc):
+                logger.warning(
+                    "Qoder disconnect (attempt %d/%d) — retrying after 1s: %s",
+                    attempt, max_retries, str(exc)[:120],
+                )
+                await asyncio.sleep(1)
+                continue
+            # Not retryable, or last attempt — re-raise
+            raise
+
+    # Unreachable, but satisfy type-checker
+    if last_exc:
+        raise last_exc
