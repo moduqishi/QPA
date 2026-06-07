@@ -407,8 +407,8 @@ async def chat_completions(request: Request):
     if image_urls:
         mc["is_vl"] = True
 
-    # Forward OpenAI sampling params to Qoder body (both model_config and parameters)
-    for p in ("temperature", "top_p", "max_tokens"):
+    # Forward OpenAI sampling params to Qoder body
+    for p in ("temperature", "top_p", "max_tokens", "max_completion_tokens"):
         if p in req:
             mc[p] = req[p]
 
@@ -416,13 +416,25 @@ async def chat_completions(request: Request):
     params["context_length"] = pool.default_context_length
     if "tool_choice" in req:
         params["tool_choice"] = req["tool_choice"]
-    # Also seed parameters with forwarded values so Qoder doesn't fall back to chat defaults
-    for p in ("temperature", "top_p", "max_tokens"):
+    for p in ("temperature", "top_p", "max_tokens", "max_completion_tokens"):
         if p in req:
             params[p] = req[p]
-        elif p not in params:
-            # Already set from baseprompt template — keep as is
-            pass
+
+    # reasoning_effort handling
+    # Codex sends reasoning_effort ("low"|"medium"|"high") but Qoder doesn't
+    # understand this field.  More importantly, "high" reasoning on Qoder
+    # consistently hits a ~66s upstream gateway timeout.  We explicitly force
+    # is_reasoning=false everywhere to prevent the long-thinking dead zone
+    # and keep tool-call behavior reliable.
+    reasoning_effort = req.get("reasoning_effort")
+    if reasoning_effort:
+        logger.info("reasoning_effort=%s — forcing is_reasoning=false for Qoder compatibility", reasoning_effort)
+    mc["is_reasoning"] = False
+    extra = body.get("chat_context", {}).get("extra", {})
+    if isinstance(extra, dict):
+        mc2 = extra.get("modelConfig")
+        if isinstance(mc2, dict):
+            mc2["is_reasoning"] = False
 
     biz = body.get("business", {})
     biz["id"] = str(uuid.uuid4())
