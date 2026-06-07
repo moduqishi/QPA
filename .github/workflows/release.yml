@@ -2,8 +2,8 @@ name: Build and Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -16,12 +16,8 @@ jobs:
             target: linux-x86_64
             ext: ''
           - os: macos-latest
-            target: macos-x86_64
-            ext: ''
-          - os: macos-latest
             target: macos-arm64
             ext: ''
-            args: '--target aarch64-apple-darwin'
           - os: windows-latest
             target: windows-x86_64
             ext: '.exe'
@@ -125,12 +121,7 @@ jobs:
 
       - name: Get version
         id: version
-        run: |
-          if [[ $GITHUB_REF == refs/tags/* ]]; then
-            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          else
-            echo "version=v$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
-          fi
+        run: echo "version=v$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
 
       - name: Create Pre-release
         uses: softprops/action-gh-release@v2
