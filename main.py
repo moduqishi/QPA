@@ -338,23 +338,20 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
                           prompt: str, tools_enabled: bool, image_urls: list[str],
                           incoming_tools: list | None = None) -> list[dict]:
     """Build Qoder-format messages from OpenAI-format messages.
-    
-    Key design choices:
-    - Let Codex's original system prompt flow through unchanged.
-    - Inject tool descriptions into the LAST user message text.
-      This is critical for Qwen: it needs to see tool names/descriptions
-      RIGHT BEFORE it decides to respond.  Putting it in the system prompt
-      is not enough — Qoder may truncate or de-prioritize system messages.
-    - Do NOT inject QPA's own system prompts or reminders.
+
+    Key design:
+    - Codex's original system prompt flows through unchanged.
+    - Tool descriptions are injected into the LAST non-system user message
+      text so Qwen sees them RIGHT at the decision point.
     - Tool role messages are converted to user messages (Qoder
       does not support the tool role).
-    - Long conversations are truncated to prevent Qoder upstream
-      timeout (~66s gateway limit).
+    - Long conversations are truncated aggressively to stay under Qoder's
+      ~66s upstream gateway timeout.
     """
     rebuilt: list[dict] = []
     seen_sys: set[str] = set()
 
-    # ---- First pass: collect unique system messages from incoming request ----
+    # ---- First pass: collect unique system messages ----
     for message in incoming_messages:
         if message.get("role") == "system":
             mc = message.get("content", "")
@@ -363,7 +360,7 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
                 converted = _convert_openai_contents_to_qoder(message)
                 rebuilt.append(converted)
 
-    # ---- Fallback: if no system message from Codex and tools are enabled ----
+    # ---- Fallback: if no system message and tools enabled ----
     if not seen_sys and tools_enabled:
         sys_content = CODEX_SYSTEM_PROMPT
         tool_text = _get_tool_desc(incoming_tools)
@@ -373,6 +370,7 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
         seen_sys.add(sys_content)
 
     # ---- Second pass: process non-system messages ----
+    first_user_idx = -1  # track first user message position for truncation
     for i, message in enumerate(incoming_messages):
         if message.get("role") == "system":
             continue
@@ -398,19 +396,20 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
                 "reasoning_content_signature": "",
             }
             rebuilt.append(rebuilt_msg)
+            if first_user_idx < 0:
+                first_user_idx = len(rebuilt) - 1
             continue
 
         converted = _convert_incoming_message(converted_msg, tools_enabled, allow)
         if converted:
+            if converted.get("role") == "user" and first_user_idx < 0:
+                first_user_idx = len(rebuilt)
             rebuilt.append(converted)
 
     if not rebuilt and prompt.strip():
         rebuilt.append(_build_user_message(prompt))
 
     # ---- Inject tool descriptions into the LAST user message ----
-    # This is critical: Qwen needs to see tool names RIGHT at the decision point.
-    # The body["tools"] field may not be surfaced to the model by Qoder's API layer,
-    # so we put the descriptions into visible message text.
     if tools_enabled and len(rebuilt) >= 2:
         tool_text = _get_tool_desc(incoming_tools)
         if tool_text:
@@ -420,7 +419,6 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
                     if "[TOOLS]" not in existing and "[AVAILABLE TOOLS]" not in existing:
                         enriched = existing + "\n\n" + tool_text
                         rebuilt[j]["content"] = enriched
-                        # Also update contents if it exists (Qoder's dual-field format)
                         contents = rebuilt[j].get("contents")
                         if isinstance(contents, list):
                             for c in contents:
@@ -430,17 +428,23 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
                     break
 
     # ---- Truncate long conversations ----
-    # Qoder upstream has a ~66s gateway timeout. Long contexts increase
-    # generation latency and hit this limit. Keep first system message
-    # + last 6 non-system messages (aggressive truncation).
+    # Keep: first system message + FIRST user message (the task) + last 5 non-system messages
     if len(rebuilt) > 12:
         sys_indices = [j for j, m in enumerate(rebuilt) if m.get("role") == "system"]
         non_sys = [m for j, m in enumerate(rebuilt) if m.get("role") != "system"]
-        keep = non_sys[-6:] if len(non_sys) > 6 else non_sys
+        keep = non_sys[-5:] if len(non_sys) > 5 else non_sys
         truncated = []
         if sys_indices:
             truncated.append(copy.deepcopy(rebuilt[sys_indices[0]]))
-        if sys_indices and sys_indices[0] < len(rebuilt) - len(keep) - 1:
+        # Keep first user message if we know its index and it's not in 'keep'
+        keep_first = None
+        if first_user_idx >= 0:
+            first_msg = rebuilt[first_user_idx]
+            if first_msg not in keep:
+                keep_first = copy.deepcopy(first_msg)
+        if keep_first:
+            truncated.append(keep_first)
+        if sys_indices and (keep_first or sys_indices[0] < len(rebuilt) - len(keep) - 1):
             truncated.append({
                 "role": "system",
                 "content": "[Earlier steps omitted. Continue with the current task.]"
@@ -602,12 +606,17 @@ async def chat_completions(request: Request):
     if image_urls:
         mc["is_vl"] = True
 
-    # Forward OpenAI sampling params to Qoder body
+    # Forward sampling params to Qoder body, but OVERRIDE temperature and top_p
+    # with QPA defaults. Codex sends temperature=0 which makes the model too
+    # conservative (always outputs text instead of calling tools).
     if "parallel_tool_calls" in req:
         mc["parallel_tool_calls"] = req["parallel_tool_calls"]
-    for p in ("temperature", "top_p", "max_tokens", "max_completion_tokens"):
+    for p in ("max_tokens", "max_completion_tokens"):
         if p in req:
             mc[p] = req[p]
+    # Always use QPA's default sampling params for reliable tool-calling
+    mc["temperature"] = 0.3
+    mc["top_p"] = 1.0
 
     params = body.get("parameters", {})
     params["context_length"] = 100000
@@ -615,7 +624,10 @@ async def chat_completions(request: Request):
         params["tool_choice"] = req["tool_choice"]
     if "parallel_tool_calls" in req:
         params["parallel_tool_calls"] = req["parallel_tool_calls"]
-    for p in ("temperature", "top_p", "max_tokens", "max_completion_tokens"):
+    # Always override sampling params in parameters too
+    params["temperature"] = 0.3
+    params["top_p"] = 1.0
+    for p in ("max_tokens", "max_completion_tokens"):
         if p in req:
             params[p] = req[p]
 
@@ -641,34 +653,46 @@ async def chat_completions(request: Request):
 
     prompt = _extract_latest_user_prompt(processed_messages)
     ctx = body.get("chat_context", {})
-    # Set chat_context to the FIRST user message (the original task), not the
-    # latest one-liner. This preserves task context across rounds. If Qoder
-    # uses these fields as model input, the model still knows the original task.
-    first_prompt = ""
-    for msg in processed_messages:
-        if msg.get("role") == "user":
-            first_prompt = _normalize_message_text(msg)
-            if first_prompt.strip():
-                break
-    if isinstance(ctx.get("text"), dict): ctx["text"]["text"] = first_prompt[:500] if first_prompt else prompt
     extra = ctx.get("extra", {})
-    if isinstance(extra.get("originalContent"), dict): extra["originalContent"]["text"] = first_prompt[:500] if first_prompt else prompt
+
+    incoming_tools = req.get("tools")
+    tools_enabled = isinstance(incoming_tools, list) and len(incoming_tools) > 0
+
+    # Build the messages array first
+    body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls, incoming_tools)
+
+    # chat_context.text is used by Qoder as the model's primary prompt input.
+    # Set it to the FULL system prompt + tool descriptions + current user prompt,
+    # so the model always sees the complete context regardless of how Qoder
+    # handles the messages array vs chat_context fields.
+    chat_context_full = ""
+    for msg in body.get("messages", []):
+        if msg.get("role") == "system":
+            chat_context_full = msg.get("content", "")
+            break
+    if tools_enabled:
+        tool_text = _get_tool_desc(incoming_tools)
+        if tool_text and "[TOOLS]" not in chat_context_full:
+            chat_context_full += "\n\n" + tool_text
+    latest_prompt = prompt or ""
+    if latest_prompt:
+        chat_context_full += "\n\nCurrent request: " + latest_prompt
+    if isinstance(ctx.get("text"), dict):
+        ctx["text"]["text"] = chat_context_full
+    if isinstance(extra.get("originalContent"), dict):
+        extra["originalContent"]["text"] = chat_context_full
+
     biz["name"] = prompt[:30] if len(prompt) > 30 else prompt
 
     if image_urls:
         ctx["imageUrls"] = image_urls
 
-    incoming_tools = req.get("tools")
-    tools_enabled = isinstance(incoming_tools, list) and len(incoming_tools) > 0
+    # chatPrompt/chat_prompt: These Qoder-level system fields might override
+    # the messages array system prompt. Leave them empty so Codex's native
+    # system prompt in the messages array is the only instruction.
+    ctx["chatPrompt"] = ""
+    body["chat_prompt"] = ""
 
-    # chatPrompt/chat_prompt: Leave EMPTY.
-    # These Qoder-level system fields might override the messages array system
-    # prompt.  Setting them interferes with Codex's native system prompt.
-    # The tool-use instructions are in the messages themselves.
-    if tools_enabled:
-        ctx["chatPrompt"] = ""
-        body["chat_prompt"] = ""
-    body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls, incoming_tools)
     if tools_enabled:
         body["tools"] = copy.deepcopy(incoming_tools)
 
