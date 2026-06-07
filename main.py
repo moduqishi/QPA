@@ -566,28 +566,58 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
         truncated.extend(keep)
         rebuilt = truncated
     
-    # ---- Inject tool definitions into the LAST user message text ----
-    # Only inject if the message doesn't already have them (prevents duplicate
-    # accumulation across rounds).
+    # ---- Inject tool definitions + directive ----
+    # Inject into the system prompt at position 0 (always survives truncation)
+    # AND as a separate system message before the last user message (maximizes
+    # attention weight at the model's decision point).
     if tools_enabled and len(rebuilt) >= 2:
         tool_text = _get_tool_desc(incoming_tools)
         if not tool_text:
             return rebuilt
+        
+        # Inject into last user message (only if not already there)
         for j in range(len(rebuilt) - 1, -1, -1):
             if rebuilt[j].get("role") == "user":
                 msg = rebuilt[j]
                 existing = _normalize_message_text(msg)
-                # Skip if tools already injected (check for [AVAILABLE TOOLS] marker)
-                if "[AVAILABLE TOOLS]" in existing:
-                    break
-                enriched = existing + "\n\n" + tool_text
-                msg["content"] = enriched
-                if msg.get("contents") and isinstance(msg["contents"], list):
-                    for c in msg["contents"]:
-                        if isinstance(c, dict) and c.get("type") == "text":
-                            c["text"] = enriched
-                            break
+                if "[AVAILABLE TOOLS]" not in existing:
+                    enriched = existing + "\n\n" + tool_text
+                    msg["content"] = enriched
+                    if msg.get("contents") and isinstance(msg["contents"], list):
+                        for c in msg["contents"]:
+                            if isinstance(c, dict) and c.get("type") == "text":
+                                c["text"] = enriched
+                                break
                 break
+        
+        # Also inject a strong system reminder right before the last user message.
+        # This carries extra directive weight as a system role message near the
+        # model's decision point.
+        last_ui = -1
+        for j in range(len(rebuilt) - 1, -1, -1):
+            if rebuilt[j].get("role") == "user":
+                last_ui = j
+                break
+        if last_ui >= 0:
+            REMINDER_TEXT = (
+                "REMINDER: You have tools and you MUST call them. "
+                "Execute the user request by calling the appropriate tool. "
+                "Do NOT describe what you will do. "
+                "Do NOT output a plan. "
+                "If you start with 'I will' or 'Let me' or 'First', "
+                "you are failing. Call a tool now."
+            )
+            REMINDER_MARKER = "<<TOOL_REMINDER>>"
+            # Dedup: check if we already injected this reminder
+            already = False
+            if last_ui > 0 and rebuilt[last_ui - 1].get("role") == "system":
+                if REMINDER_MARKER in str(rebuilt[last_ui - 1].get("content", "")):
+                    already = True
+            if not already:
+                rebuilt.insert(last_ui, {
+                    "role": "system",
+                    "content": REMINDER_MARKER + "\n" + REMINDER_TEXT
+                })
     
     return rebuilt
 
