@@ -129,6 +129,18 @@ def _sign_and_auth(
     return bearer, date, sig
 
 
+_503_RETRYABLE = (
+    "503",
+    "upstream connect error",
+    "connection termination",
+)
+
+
+def _is_retryable_503(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(p in msg for p in _503_RETRYABLE)
+
+
 async def open_stream(
     sess: SessionContext,
     url: str,
@@ -137,12 +149,9 @@ async def open_stream(
 ):
     """Async SSE stream — yields raw lines from the Qoder API.
 
-    Uses httpx.AsyncClient with no read timeout so long-reasoning
-    tasks are not cut off prematurely.
-
-    NOTE: No automatic retry.  If the upstream disconnects mid-stream
-    the exception propagates so the caller (Codex) can retry with a
-    *fresh* request body (new UUIDs etc.), avoiding Qoder cache issues.
+    Automatically retries once on:
+    - HTTP 503 / upstream connect errors (transient Qoder infrastructure)
+    - Mid-stream peer disconnects (incomplete chunked read)
     """
     body = qoder_encode(json.dumps(body_obj).encode())
     bearer, cosy_date, _ = _sign_and_auth(sess, url, body)
@@ -151,23 +160,73 @@ async def open_stream(
     headers["authorization"] = bearer
     headers["cosy-date"] = cosy_date
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=30, read=None, write=30, pool=30),
-        limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
-    ) as client:
-        async with client.stream(
-            "POST", url, content=body, headers=headers
-        ) as resp:
-            if resp.status_code != 200:
-                err_body = await resp.aread()
-                msg = f"Qoder HTTP {resp.status_code} body={err_body.decode()}"
-                logger.error(msg)
-                raise RuntimeError(msg)
+    max_retries = 2
+    last_exc = None
 
-            line_count = 0
-            async for line in resp.aiter_lines():
-                if line:
-                    line_count += 1
-                    yield line
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=30, read=None, write=30, pool=30),
+                limits=httpx.Limits(
+                    max_keepalive_connections=4, max_connections=8
+                ),
+            ) as client:
+                async with client.stream(
+                    "POST", url, content=body, headers=headers
+                ) as resp:
+                    if resp.status_code != 200:
+                        err_body = await resp.aread()
+                        msg = (
+                            f"Qoder HTTP {resp.status_code} body={err_body.decode()}"
+                        )
+                        logger.error(msg)
+                        raise RuntimeError(msg)
 
-            logger.debug("Qoder stream done: %d lines", line_count)
+                    line_count = 0
+                    async for line in resp.aiter_lines():
+                        if line:
+                            line_count += 1
+                            yield line
+
+                    logger.debug(
+                        "Qoder stream done: %d lines (attempt %d)",
+                        line_count,
+                        attempt,
+                    )
+                    return  # success
+
+        except Exception as exc:
+            last_exc = exc
+            retryable = False
+
+            # Check for 503/upstream error
+            if _is_retryable_503(exc):
+                retryable = True
+                log_msg = "Qoder 503/upstream error"
+
+            # Check for mid-stream disconnect
+            msg = str(exc).lower()
+            if not retryable and (
+                "peer closed connection" in msg or "incomplete chunked" in msg
+            ):
+                retryable = True
+                log_msg = "Qoder disconnect"
+
+            if retryable and attempt < max_retries:
+                logger.warning(
+                    "%s (attempt %d/%d) — retrying after 1s: %s",
+                    log_msg,
+                    attempt,
+                    max_retries,
+                    str(exc)[:120],
+                )
+                await asyncio.sleep(1)
+                continue
+
+            # Not retryable, or last attempt
+            raise
+
+    # All retries exhausted
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("open_stream failed after all retries")
