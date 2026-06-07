@@ -187,7 +187,8 @@ def _build_user_message(text: str) -> dict:
             "response_meta": _blank_response_meta(), "reasoning_content_signature": ""}
 
 def _build_structured_message(role: str, text: str) -> dict:
-    return {"role": role, "content": text or "", "response_meta": _blank_response_meta(),
+    return {"role": role, "content": text or "", "contents": [{"type": "text", "text": text or ""}],
+            "response_meta": _blank_response_meta(),
             "reasoning_content_signature": ""}
 
 def _build_tool_message(message: dict, text: str) -> dict:
@@ -226,9 +227,18 @@ def _convert_incoming_message(message: dict, tools_enabled: bool, allow_stc: boo
 
     if role == "assistant" and structured_tc is not None:
         content = text or ""
-        if _parse_tool_calls_text(content) is not None: content = ""
+        # Render tool calls as text in content for Qoder compatibility
+        tc_text = _render_tool_calls(structured_tc)
+        if _parse_tool_calls_text(content) is not None:
+            content = ""  # Tool calls already in text, don't duplicate
         out = _build_structured_message("assistant", content)
         out["tool_calls"] = copy.deepcopy(structured_tc)
+        # For Qoder's text-based format, add tool calls as content text too
+        text_contents = [{"type": "text", "text": tc_text}]
+        if content:
+            text_contents.insert(0, {"type": "text", "text": content})
+        out["contents"] = text_contents
+        # Also add tool_calls as a contents entry if Qoder supports it
         return out
 
     if role == "assistant" and any_tc is not None and not allow_stc:
@@ -352,6 +362,9 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
             if mc and mc not in seen_sys:
                 seen_sys.add(mc)
                 converted = _convert_openai_contents_to_qoder(message)
+                if "contents" not in converted:
+                    converted = copy.deepcopy(converted)
+                    converted["contents"] = [{"type": "text", "text": converted.get("content", "")}]
                 rebuilt.append(converted)
 
     # ---- Fallback: if no system message and tools enabled ----
@@ -360,7 +373,7 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
         tool_text = _get_tool_desc(incoming_tools)
         if tool_text:
             sys_content += "\n\n" + tool_text
-        rebuilt.insert(0, {"role": "system", "content": sys_content})
+        rebuilt.insert(0, {"role": "system", "content": sys_content, "contents": [{"type": "text", "text": sys_content}]})
         seen_sys.add(sys_content)
 
     # ---- Second pass: process non-system messages ----
@@ -425,7 +438,8 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
         if sys_indices and (keep_first or sys_indices[0] < len(rebuilt) - len(keep) - 1):
             truncated.append({
                 "role": "system",
-                "content": "[Earlier steps omitted. Continue with the current task.]"
+                "content": "[Earlier steps omitted. Continue with the current task.]",
+                "contents": [{"type": "text", "text": "[Earlier steps omitted. Continue with the current task.]"}]
             })
         truncated.extend(keep)
         rebuilt = truncated
