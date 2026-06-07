@@ -160,8 +160,9 @@ async def open_stream(
     headers["authorization"] = bearer
     headers["cosy-date"] = cosy_date
 
-    max_retries = 2
+    max_retries = 3
     last_exc = None
+    backoff = [0.5, 1.5, 3.0]
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -195,9 +196,12 @@ async def open_stream(
                     )
                     return  # success
 
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             last_exc = exc
             retryable = False
+            backoff_sec = backoff[min(attempt - 1, len(backoff) - 1)]
 
             # Check for 503/upstream error
             if _is_retryable_503(exc):
@@ -214,13 +218,14 @@ async def open_stream(
 
             if retryable and attempt < max_retries:
                 logger.warning(
-                    "%s (attempt %d/%d) — retrying after 1s: %s",
+                    "%s (attempt %d/%d) — retrying after %.1fs: %s",
                     log_msg,
                     attempt,
                     max_retries,
+                    backoff_sec,
                     str(exc)[:120],
                 )
-                await asyncio.sleep(1)
+                await asyncio.sleep(backoff_sec)
                 continue
 
             # Not retryable, or last attempt

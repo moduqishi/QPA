@@ -244,7 +244,16 @@ TOOL_INSTRUCTION = (
     "run commands, modify projects - you MUST use the tools to actually do it. "
     "Do NOT just describe what you would do. Do NOT output a plan without executing steps. "
     "Call the appropriate tool directly instead of narrating your intent. "
-    "After each tool result, decide the next action and take it immediately."
+    "After each tool result, decide the next action and take it immediately.\n\n"
+    "--- TOOL CALL FORMAT ---\n"
+    "When you need to call tools, output them in this EXACT format:\n"
+    "Tool calls:\n"
+    "\"\"\"json\n"
+    "[{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"tool_name\", \"arguments\": \"{...}\"}}]\n"
+    "\"\"\"\n"
+    "---\n"
+    "NEVER reply with just a plan or description. Call a tool immediately.\n"
+    "If you catch yourself starting a sentence with \"I will\" or \"Let me\", STOP and call a tool instead."
 )
 
 def _build_qoder_messages(template_messages: list, incoming_messages: list[dict],
@@ -289,6 +298,25 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
 
     if not rebuilt and prompt.strip():
         rebuilt.append(_build_user_message(prompt))
+    
+    # Inject a fresh tool-call reminder right before the last user message
+    # to keep the instruction visible even in long conversations.
+    if tools_enabled and len(rebuilt) >= 3:
+        last_ui = None
+        for j in range(len(rebuilt) - 1, -1, -1):
+            if rebuilt[j].get("role") == "user":
+                last_ui = j
+                break
+        if last_ui is not None and last_ui > 0:
+            rebuilt.insert(last_ui, {
+                "role": "system",
+                "content": (
+                    "REMINDER: You have tools. Call them NOW.\n"
+                    "Do NOT describe what you will do — actually execute it with a tool call.\n"
+                    "Use: Tool calls: ```json [...tool calls json...] ```"
+                ),
+            })
+    
     return rebuilt
 
 
@@ -422,6 +450,8 @@ async def chat_completions(request: Request):
         mc["is_vl"] = True
 
     # Forward OpenAI sampling params to Qoder body
+    if "parallel_tool_calls" in req:
+        mc["parallel_tool_calls"] = req["parallel_tool_calls"]
     for p in ("temperature", "top_p", "max_tokens", "max_completion_tokens"):
         if p in req:
             mc[p] = req[p]
@@ -430,6 +460,8 @@ async def chat_completions(request: Request):
     params["context_length"] = pool.default_context_length
     if "tool_choice" in req:
         params["tool_choice"] = req["tool_choice"]
+    if "parallel_tool_calls" in req:
+        params["parallel_tool_calls"] = req["parallel_tool_calls"]
     for p in ("temperature", "top_p", "max_tokens", "max_completion_tokens"):
         if p in req:
             params[p] = req[p]
@@ -471,8 +503,13 @@ async def chat_completions(request: Request):
     # top level, NOT in the messages array, so it won't get truncated in long convs.
     if tools_enabled:
         ctx["chatPrompt"] = (
-            "IMPORTANT: You have tools available. "
-            "Actually use them to do the work — do not just narrate what you would do."
+            "CRITICAL: You MUST call tools to do the work. Never just describe what you would do.\n"
+            "Output tool calls in this format:\n"
+            "Tool calls:\n"
+            "\"\"\"json\n"
+            "[...tool call json...]\n"
+            "\"\"\"\n"
+            "If you start typing 'I will' or 'Let me', STOP and call a tool directly instead."
         )
     body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls)
     if tools_enabled:
@@ -607,8 +644,17 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
                 full_content += pending_content
             pending_content = ""
 
+        # If the stream was empty (no content, no tool calls) and the upstream
+        # disconnected, emit an error event so Codex knows to retry rather than
+        # thinking the task is done.
+        had_no_output = not emitted_chunk and not full_content and tc_acc.is_empty() and not pending_content
+        if had_no_output and is_disconnect:
+            err_chunk = _make_chunk(req_id, created, model)
+            err_chunk["error"] = {"message": err_msg[:200], "type": "upstream_disconnect"}
+            yield _sse_line(err_chunk)
+
         final = _make_chunk(req_id, created, model)
-        final["choices"][0]["finish_reason"] = "stop"
+        final["choices"][0]["finish_reason"] = "stop" if not (had_no_output and is_disconnect) else "length"
         final["choices"][0]["delta"] = {}
         yield _sse_line(final)
         if include_usage:
