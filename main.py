@@ -466,6 +466,14 @@ async def chat_completions(request: Request):
 
     incoming_tools = req.get("tools")
     tools_enabled = isinstance(incoming_tools, list) and len(incoming_tools) > 0
+
+    # Set chatPrompt as a tool-use reminder — this field lives at the Qoder body
+    # top level, NOT in the messages array, so it won't get truncated in long convs.
+    if tools_enabled:
+        ctx["chatPrompt"] = (
+            "IMPORTANT: You have tools available. "
+            "Actually use them to do the work — do not just narrate what you would do."
+        )
     body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls)
     if tools_enabled:
         body["tools"] = copy.deepcopy(incoming_tools)
