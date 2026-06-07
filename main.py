@@ -144,7 +144,7 @@ def _summarize_unresolved_tool_calls(tool_calls: list[dict]) -> str:
     return sb + "."
 
 def _build_user_message(text: str) -> dict:
-    return {"role": "user", "content": "", "contents": [{"type": "text", "text": text}],
+    return {"role": "user", "content": text, "contents": [{"type": "text", "text": text}],
             "response_meta": _blank_response_meta(), "reasoning_content_signature": ""}
 
 def _build_structured_message(role: str, text: str) -> dict:
@@ -260,9 +260,10 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
                     break
 
         if has_images and converted_msg.get("role") == "user":
+            img_text = _normalize_message_text(converted_msg)
             rebuilt_msg = {
                 "role": "user",
-                "content": "",
+                "content": img_text,
                 "contents": copy.deepcopy(contents),
                 "response_meta": _blank_response_meta(),
                 "reasoning_content_signature": "",
@@ -459,6 +460,13 @@ async def chat_completions(request: Request):
     extra_headers = {"x-model-key": model, "x-model-source": mc.get("source", "system")}
     req_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
+
+    # Log the full request body for debugging Qoder tool-call behavior
+    body_preview = json.dumps(body, ensure_ascii=False)
+    logger.info("Qoder body (req=%s, msgs=%d, tools=%d): %s",
+                req_id, len(body.get("messages", [])),
+                len(body.get("tools", [])),
+                body_preview[:2000])
 
     if stream:
         return StreamingResponse(

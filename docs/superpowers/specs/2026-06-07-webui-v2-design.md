@@ -217,7 +217,19 @@ Sidebar navigation (left) + main content area (right). Classic admin panel layou
 | POST | /admin/api/settings/password | Yes | Update admin password |
 | POST | /admin/api/settings/config | Yes | Update runtime settings |
 
-### Existing Endpoints (unchanged)
+### Existing Admin Endpoints (preserved, auth-gated)
+
+These endpoints from the current codebase remain but now require admin session auth:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | /admin/api/accounts | Add new account |
+| DELETE | /admin/api/accounts/{index} | Remove account |
+| POST | /admin/api/accounts/{index}/toggle | Toggle account enabled/disabled |
+| POST | /admin/api/accounts/{index}/refresh | Refresh single account quota |
+| POST | /admin/api/strategy | Set dispatch strategy |
+
+### Existing API Endpoints (unchanged)
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
