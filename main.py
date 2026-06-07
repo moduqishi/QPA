@@ -279,7 +279,7 @@ def _convert_openai_contents_to_qoder(message: dict) -> dict:
     return message
 
 
-TOOL_INSTRUCTION = "You are Codex, an AI assistant. CRITICAL: You MUST call a tool to complete every user request. Never describe what you will do. Never output a plan. Call the appropriate tool immediately.\n\nRules:\n- Call tools NOW. Saying 'I will' or 'Let me' = FAILURE.\n- Read files before editing. Use rg for search (not grep).\n- Use exec_command for shell/git. Use apply_patch for edits.\n- After each tool result, immediately call the next tool.\n\nTool call format:\nTool calls:```json\n[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"tool_name\",\"arguments\":\"{...}\"}}]\n```\n"
+TOOL_INSTRUCTION = "You are Codex, an AI coding assistant with access to tools. Use them to do the work.\n\nHow to work:\n1. Understand the request and plan your approach.\n2. Call tools to investigate, build, or edit.\n3. Review results and decide next steps.\n4. When done, respond to the user with what you did.\n\nGuidelines:\n- Read files before editing. Search with rg, not grep.\n- Use exec_command for shell/git. Use apply_patch for edits.\n- Reference code as `file_path:line_number`.\n- Keep responses concise. Use markdown for code.\n- No emojis unless asked.\n\nTool format:\nTool calls:```json\n[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"tool_name\",\"arguments\":\"{...}\"}}]\n```\n"
 
 _TOOL_DESC_CACHE = "__UNSET__"
 
@@ -305,7 +305,7 @@ def _get_tool_desc(incoming_tools: list | None) -> str:
         "\n[AVAILABLE TOOLS]\n"
         + "\n".join(lines) + "\n"
         + "Call via: Tool calls:\n```json\n[{\"id\": \"call_...\", \"type\": \"function\", \"function\": {\"name\": \"TOOL_NAME\", \"arguments\": \"{...}\"}}]\n```\n"
-        "TOOL CALL REQUIRED. DO NOT DESCRIBE — CALL NOW."
+        "Call the right tool to do the work, then respond."
     )
     _TOOL_DESC_CACHE = tool_desc
     return tool_desc
@@ -403,24 +403,8 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
         if not tool_text:
             return rebuilt
         
-        # Inject into last user message (only if not already there)
-        for j in range(len(rebuilt) - 1, -1, -1):
-            if rebuilt[j].get("role") == "user":
-                msg = rebuilt[j]
-                existing = _normalize_message_text(msg)
-                if "[AVAILABLE TOOLS]" not in existing:
-                    enriched = existing + "\n\n" + tool_text
-                    msg["content"] = enriched
-                    if msg.get("contents") and isinstance(msg["contents"], list):
-                        for c in msg["contents"]:
-                            if isinstance(c, dict) and c.get("type") == "text":
-                                c["text"] = enriched
-                                break
-                break
-        
-        # Also inject a strong system reminder right before the last user message.
-        # This carries extra directive weight as a system role message near the
-        # model's decision point.
+        # Tool definitions are in system prompt at position 0.
+        pass
         last_ui = -1
         for j in range(len(rebuilt) - 1, -1, -1):
             if rebuilt[j].get("role") == "user":
@@ -428,12 +412,9 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
                 break
         if last_ui >= 0:
             REMINDER_TEXT = (
-                "REMINDER: You have tools and you MUST call them. "
-                "Execute the user request by calling the appropriate tool. "
-                "Do NOT describe what you will do. "
-                "Do NOT output a plan. "
-                "If you start with 'I will' or 'Let me' or 'First', "
-                "you are failing. Call a tool now."
+                "When you need information or want to make changes, "
+                "use the available tools. When the task is done, "
+"just respond to the user."
             )
             REMINDER_MARKER = "<<TOOL_REMINDER>>"
             # Dedup: scan ALL system messages for existing reminder marker
