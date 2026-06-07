@@ -279,7 +279,30 @@ def _convert_openai_contents_to_qoder(message: dict) -> dict:
     return message
 
 
-TOOL_INSTRUCTION = "You are Codex, an AI coding assistant with access to tools. Use them to do the work.\n\nHow to work:\n1. Understand the request and plan your approach.\n2. Call tools to investigate, build, or edit.\n3. Review results and decide next steps.\n4. When done, respond to the user with what you did.\n\nGuidelines:\n- Read files before editing. Search with rg, not grep.\n- Use exec_command for shell/git. Use apply_patch for edits.\n- Reference code as `file_path:line_number`.\n- Keep responses concise. Use markdown for code.\n- No emojis unless asked.\n\nTool format:\nTool calls:```json\n[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"tool_name\",\"arguments\":\"{...}\"}}]\n```\n"
+CODEX_SYSTEM_PROMPT = """You are Codex, a coding agent based on GPT-5. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled.
+
+You are an AI coding assistant with access to tools that let you execute commands, read and edit files, search code, and manage git.
+
+# How to work
+1. Understand the request and plan your approach.
+2. Use tools to investigate, build, or edit — never just describe what you would do.
+3. Review tool results and decide next steps.
+4. When done, respond to the user with what you did.
+
+# Guidelines
+- Read files before editing. Use rg (ripgrep) for fast file content searching.
+- Use exec_command for shell/git commands. Use apply_patch for precise code edits.
+- Reference code as file_path:line_number.
+- Keep responses concise. Use GitHub-flavored markdown for formatting.
+- No emojis unless asked.
+
+# Tool format
+Tool calls:
+```json
+[{"id":"call_1","type":"function","function":{"name":"tool_name","arguments":"{...}"}}]
+```
+
+Call tools whenever you need information or want to make changes. After each tool result, decide the next action and take it."""
 
 _TOOL_DESC_CACHE = "__UNSET__"
 
@@ -302,51 +325,60 @@ def _get_tool_desc(incoming_tools: list | None) -> str:
         else:
             lines.append(f"  {name}: {desc}")
     tool_desc = (
-        "\n[AVAILABLE TOOLS]\n"
+        "\n[TOOLS]\n"
         + "\n".join(lines) + "\n"
-        + "Call via: Tool calls:\n```json\n[{\"id\": \"call_...\", \"type\": \"function\", \"function\": {\"name\": \"TOOL_NAME\", \"arguments\": \"{...}\"}}]\n```\n"
-        "Call the right tool to do the work, then respond."
+        + 'Call via: Tool calls:\n```json\n[{"id": "call_...", "type": "function", "function": {"name": "TOOL_NAME", "arguments": "{...}"}}]\n```\n'
     )
     _TOOL_DESC_CACHE = tool_desc
     return tool_desc
 
 
+
 def _build_qoder_messages(template_messages: list, incoming_messages: list[dict],
                           prompt: str, tools_enabled: bool, image_urls: list[str],
                           incoming_tools: list | None = None) -> list[dict]:
-    rebuilt: list[dict] = []
+    """Build Qoder-format messages from OpenAI-format messages.
     
-    # Always inject tool instruction as the first system message.
-    if tools_enabled:
-        # Inject tool definitions into the system prompt itself, not just
-        # the last user message.  This ensures tools are visible even if
-        # Qoder truncates the messages array from the end.
-        sys_content = TOOL_INSTRUCTION
+    Key design choices:
+    - Let Codex's original system prompt flow through unchanged.
+    - Do NOT inject QPA's own system prompts or reminders.
+    - If no system message from Codex and tools are enabled,
+      inject CODEX_SYSTEM_PROMPT + tool descriptions as fallback.
+    - Tool descriptions are appended to the first system message
+      as a reference, not as a replacement.
+    - Tool role messages are converted to user messages (Qoder
+      does not support the tool role).
+    - Long conversations are truncated to prevent Qoder upstream
+      timeout (~66s gateway limit).
+    """
+    rebuilt: list[dict] = []
+    seen_sys: set[str] = set()
+
+    # ---- First pass: collect all unique system messages from incoming request ----
+    # Codex always sends its own system prompt. We let it through.
+    for message in incoming_messages:
+        if message.get("role") == "system":
+            mc = message.get("content", "")
+            if mc and mc not in seen_sys:
+                seen_sys.add(mc)
+                converted = _convert_openai_contents_to_qoder(message)
+                rebuilt.append(converted)
+
+    # ---- Fallback: if no system message from Codex and tools are enabled ----
+    if not seen_sys and tools_enabled:
+        sys_content = CODEX_SYSTEM_PROMPT
         tool_text = _get_tool_desc(incoming_tools)
         if tool_text:
             sys_content += "\n\n" + tool_text
-        rebuilt.append({"role": "system", "content": sys_content})
-    
-    # Template system messages are not needed — TOOL_INSTRUCTION is already injected.
-    pass
+        rebuilt.insert(0, {"role": "system", "content": sys_content})
+        seen_sys.add(sys_content)
 
-    # Track system message content hashes to dedup
-    seen_sys = set()
-    for msg in rebuilt:
-        if msg.get("role") == "system":
-            seen_sys.add(msg.get("content", ""))
-
+    # ---- Second pass: process remaining (non-system) messages ----
     for i, message in enumerate(incoming_messages):
-        allow = tools_enabled and _has_resolved_tool_response(incoming_messages, i)
-        
-        # Skip system messages already present in rebuilt (prevents
-        # TOOL_INSTRUCTION from being duplicated every round).
         if message.get("role") == "system":
-            mc = message.get("content", "")
-            if mc in seen_sys:
-                continue
-            seen_sys.add(mc)
-        
+            continue  # already handled above
+
+        allow = tools_enabled and _has_resolved_tool_response(incoming_messages, i)
         converted_msg = _convert_openai_contents_to_qoder(message)
 
         contents = converted_msg.get("contents") if isinstance(converted_msg.get("contents"), list) else None
@@ -370,65 +402,42 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
             continue
 
         converted = _convert_incoming_message(converted_msg, tools_enabled, allow)
-        if converted: rebuilt.append(converted)
+        if converted:
+            rebuilt.append(converted)
 
     if not rebuilt and prompt.strip():
         rebuilt.append(_build_user_message(prompt))
-    
+
+    # ---- Append tool descriptions to the first system message as reference ----
+    if tools_enabled and rebuilt and rebuilt[0].get("role") == "system":
+        # Check if tool desc is already present
+        existing = rebuilt[0].get("content", "")
+        has_tool_list = "[TOOLS]" in existing or "[AVAILABLE TOOLS]" in existing
+        if not has_tool_list:
+            tool_text = _get_tool_desc(incoming_tools)
+            if tool_text:
+                rebuilt[0]["content"] = existing + "\n\n" + tool_text
+
     # ---- Truncate long conversations ----
-    if len(rebuilt) > 12:
+    # Qoder upstream has a ~66s gateway timeout. Long contexts increase
+    # generation latency and hit this limit. We truncate aggressively:
+    # keep first system message + last 8 non-system messages.
+    truncation_threshold = 14
+    if len(rebuilt) > truncation_threshold:
         sys_indices = [j for j, m in enumerate(rebuilt) if m.get("role") == "system"]
         non_sys = [m for j, m in enumerate(rebuilt) if m.get("role") != "system"]
         keep = non_sys[-8:] if len(non_sys) > 8 else non_sys
         truncated = []
-        # Keep only the FIRST system msg (TOOL_INSTRUCTION) and the LAST one
         if sys_indices:
             truncated.append(copy.deepcopy(rebuilt[sys_indices[0]]))
-            if len(sys_indices) > 1 and sys_indices[-1] != sys_indices[0]:
-                truncated.append(copy.deepcopy(rebuilt[sys_indices[-1]]))
-        if sys_indices and sys_indices[-1] + 1 < len(rebuilt) - len(keep):
+        if sys_indices and sys_indices[0] < len(rebuilt) - len(keep) - 1:
             truncated.append({
                 "role": "system",
                 "content": "[Earlier steps omitted. Continue with the current task.]"
             })
         truncated.extend(keep)
         rebuilt = truncated
-    
-    # ---- Inject tool definitions + directive ----
-    # Inject into the system prompt at position 0 (always survives truncation)
-    # AND as a separate system message before the last user message (maximizes
-    # attention weight at the model's decision point).
-    if tools_enabled and len(rebuilt) >= 2:
-        tool_text = _get_tool_desc(incoming_tools)
-        if not tool_text:
-            return rebuilt
-        
-        # Tool definitions are in system prompt at position 0.
-        pass
-        last_ui = -1
-        for j in range(len(rebuilt) - 1, -1, -1):
-            if rebuilt[j].get("role") == "user":
-                last_ui = j
-                break
-        if last_ui >= 0:
-            REMINDER_TEXT = (
-                "When you need information or want to make changes, "
-                "use the available tools. When the task is done, "
-"just respond to the user."
-            )
-            REMINDER_MARKER = "<<TOOL_REMINDER>>"
-            # Dedup: scan ALL system messages for existing reminder marker
-            already = False
-            for msg in rebuilt:
-                if msg.get("role") == "system" and REMINDER_MARKER in str(msg.get("content", "")):
-                    already = True
-                    break
-            if not already:
-                rebuilt.insert(last_ui, {
-                    "role": "system",
-                    "content": REMINDER_MARKER + "\n" + REMINDER_TEXT
-                })
-    
+
     return rebuilt
 
 
@@ -632,11 +641,17 @@ async def chat_completions(request: Request):
     incoming_tools = req.get("tools")
     tools_enabled = isinstance(incoming_tools, list) and len(incoming_tools) > 0
 
-    # Set chatPrompt as a tool-use reminder — this field lives at the Qoder body
-    # top level, NOT in the messages array, so it won't get truncated in long convs.
+    # chatPrompt: Qoder-level system field. Set to a clear tool-use instruction.
+    # This lives at the Qoder body top level, NOT in the messages array, so it
+    # survives any truncation Qoder may apply to the messages array.
     if tools_enabled:
         ctx["chatPrompt"] = (
-            "Call tools immediately. Do not describe — do it."
+            "Use available tools to do the work. "
+            "Call tools when you need information or want to make changes."
+        )
+        body["chat_prompt"] = (
+            "Use available tools to do the work. "
+            "Call tools when you need information or want to make changes."
         )
     body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls, incoming_tools)
     if tools_enabled:
