@@ -5,7 +5,7 @@
   "stream": true,
   "chat_task": "FREE_INPUT",
   "chat_context": {
-    "chatPrompt": "You are an AI assistant that MUST use the available tools to complete any task. Never just describe what you would do — actually do it by calling the appropriate tool.",
+    "chatPrompt": "",
     "extra": {
       "context": [],
       "modelConfig": {
@@ -31,7 +31,7 @@
   "code_language": "",
   "source": 1,
   "version": "3",
-  "chat_prompt": "You are an AI assistant that MUST use the available tools to complete any task. Never just describe what you would do — actually do it by calling the appropriate tool.",
+  "chat_prompt": "",
   "parameters": {
     "max_tokens": 65536,
     "temperature": 0.1,
