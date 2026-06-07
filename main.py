@@ -322,6 +322,7 @@ def _get_tool_desc(incoming_tools: list | None) -> str:
     tool_desc = (
         "\n[TOOLS]\n"
         + "\n".join(lines) + "\n"
+        + "To call a tool, respond with:\nTool calls:\n```json\n[{\"id\": \"call_...\", \"function\": {\"name\": \"TOOL_NAME\", \"arguments\": \"{...}\"}}]\n```\n"
     )
     _TOOL_DESC_CACHE = tool_desc
     return tool_desc
@@ -594,9 +595,9 @@ async def chat_completions(request: Request):
 
     mc = body.get("model_config", {})
     mc["key"] = model
-    mc["max_input_tokens"] = 100000
+    mc["max_input_tokens"] = 50000
     mc["context_config"] = {
-        "100K": {"token_count": 100_000, "is_default": True},
+        "50K": {"token_count": 50_000, "is_default": True},
     }
     if image_urls:
         mc["is_vl"] = True
@@ -604,23 +605,19 @@ async def chat_completions(request: Request):
     # Forward sampling params to Qoder body, but OVERRIDE temperature and top_p
     # with QPA defaults. Codex sends temperature=0 which makes the model too
     # conservative (always outputs text instead of calling tools).
-    if "parallel_tool_calls" in req:
-        mc["parallel_tool_calls"] = req["parallel_tool_calls"]
     for p in ("max_tokens", "max_completion_tokens"):
         if p in req:
             mc[p] = req[p]
-    # Always use QPA's default sampling params for reliable tool-calling
-    mc["temperature"] = 0.3
+    # Override sampling params — Codex sends temp=0 which makes model too
+    # conservative to call tools.
+    mc["temperature"] = 0.5
     mc["top_p"] = 1.0
 
     params = body.get("parameters", {})
-    params["context_length"] = 100000
+    params["context_length"] = 50000
     if "tool_choice" in req:
         params["tool_choice"] = req["tool_choice"]
-    if "parallel_tool_calls" in req:
-        params["parallel_tool_calls"] = req["parallel_tool_calls"]
-    # Always override sampling params in parameters too
-    params["temperature"] = 0.3
+    params["temperature"] = 0.5
     params["top_p"] = 1.0
     for p in ("max_tokens", "max_completion_tokens"):
         if p in req:

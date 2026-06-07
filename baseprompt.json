@@ -34,7 +34,7 @@
   "chat_prompt": "",
   "parameters": {
     "max_tokens": 65536,
-    "temperature": 0.3,
+    "temperature": 0.5,
     "top_p": 1.0
   },
   "aliyun_user_type": "personal_standard",
