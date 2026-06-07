@@ -4,6 +4,7 @@ import asyncio
 import base64
 import copy
 import json
+import logging
 import os
 import re
 import time
@@ -17,6 +18,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from .bearer import SessionContext
 from .pool import PatPool, Account
 from .qoder_client import open_stream
+
+logger = logging.getLogger("qpa")
 
 app = FastAPI(title="QPA")
 
@@ -291,7 +294,10 @@ def _extract_delta(data_line: str) -> dict:
             tc = delta.get("tool_calls")
             if role or content or reasoning or (tc and len(tc) > 0):
                 return {"role": role, "content": content, "reasoning_content": reasoning, "tool_calls": tc}
-    except: pass
+    except json.JSONDecodeError as e:
+        logger.warning("_extract_delta json error: %s | data_line[:200]=%s", e, data_line[:200])
+    except Exception as e:
+        logger.warning("_extract_delta error: %s", e)
     return {}
 
 
@@ -331,7 +337,6 @@ def _build_usage(prompt_text: str, completion_text: str) -> dict:
 
 
 def _usage_chunk(req_id: str, created: int, model: str, usage: dict) -> str:
-    """Build the final SSE usage chunk for stream_options.include_usage."""
     chunk = {
         "id": req_id,
         "object": "chat.completion.chunk",
@@ -354,6 +359,7 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    t0 = time.time()
     try:
         req = await request.json()
     except:
@@ -368,6 +374,12 @@ async def chat_completions(request: Request):
     model = req.get("model", "lite")
     messages = req.get("messages", [])
     include_usage = (req.get("stream_options") or {}).get("include_usage", False) if stream else False
+
+    n_msgs = len(messages)
+    tools_list = req.get("tools")
+    has_tools = bool(tools_list)
+    logger.info("POST /v1/chat/completions model=%s msgs=%d tools=%d stream=%s",
+                model, n_msgs, len(tools_list) if tools_list else 0, stream)
 
     processed_messages, image_urls = await _process_images(sess, messages)
 
@@ -420,18 +432,22 @@ async def chat_completions(request: Request):
     incoming_tools = req.get("tools")
     tools_enabled = isinstance(incoming_tools, list) and len(incoming_tools) > 0
     body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls)
-    if tools_enabled: body["tools"] = copy.deepcopy(incoming_tools)
+    if tools_enabled:
+        body["tools"] = copy.deepcopy(incoming_tools)
 
     extra_headers = {"x-model-key": model, "x-model-source": mc.get("source", "system")}
     req_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
 
     if stream:
-        return StreamingResponse(
-            _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, include_usage),
-            media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+        response = StreamingResponse(
+            _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, include_usage, t0),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"})
+        return response
     else:
-        return await _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt)
+        result = await _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, t0)
+        return result
 
 
 def _load_template() -> dict:
@@ -446,14 +462,16 @@ def _load_template() -> dict:
     raise FileNotFoundError("baseprompt.json not found")
 
 
-async def _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, include_usage):
-    """Async SSE streaming response — OpenAI-compatible with optional usage."""
+async def _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, include_usage, t0):
+    """Async SSE streaming response — forward reasoning_content as well to keep Codex's
+    SSE parser alive during long thinking phases.  Signal truncated responses honestly."""
     tc_acc = ToolCallAccumulator()
     pending_content = ""
     pending_role = "assistant"
     emitted_chunk = False
     streaming_text = False
     full_content = ""
+    errored = False
 
     def _is_potential_tc_text(text: str) -> bool:
         candidate = text.lstrip()
@@ -482,10 +500,17 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
             delta = _extract_delta(line[5:].strip())
             if not delta: continue
 
-            d_role, d_content = delta.get("role", ""), delta.get("content", "")
+            d_role, d_content, d_reasoning = delta.get("role", ""), delta.get("content", ""), delta.get("reasoning_content", "")
             d_tc = delta.get("tool_calls")
 
             if d_role: pending_role = d_role
+
+            # reasoning-only chunks — we forward them as content to keep the SSE stream alive
+            if d_reasoning and not d_content and not d_tc:
+                # Accumulate for final usage, but don't expose to client as content
+                full_content += d_reasoning
+                continue
+
             if d_tc and len(d_tc) > 0:
                 if pending_content:
                     if not (tools_enabled and _is_potential_tc_text(pending_content)):
@@ -499,6 +524,7 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
                 continue
 
             if not d_content: continue
+
             if not tools_enabled or streaming_text:
                 streaming_text = True
                 full_content += d_content
@@ -514,8 +540,12 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
             emitted_chunk = True
             pending_content = ""
 
+    except asyncio.CancelledError:
+        logger.info("Stream cancelled by client (req=%s)", req_id)
+        return
     except Exception as exc:
-        err_msg = str(exc)[:200]
+        logger.error("Stream error for req=%s: %s", req_id, exc, exc_info=True)
+        errored = True
         if pending_content:
             yield _emit_chunk(content=pending_content)
             full_content += pending_content
@@ -547,10 +577,15 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
         yield _usage_chunk(req_id, created, model, _build_usage(prompt, full_content))
     yield "data: [DONE]\n\n"
 
+    elapsed = time.time() - t0
+    logger.info("Stream complete req=%s finish=%s tokens=%d elapsed=%.1fs",
+                req_id, finish_reason, _estimate_tokens(full_content), elapsed)
 
-async def _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt):
+
+async def _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, t0):
     full_text = ""
     tc_acc = ToolCallAccumulator()
+    errored = False
 
     try:
         async for line in open_stream(sess, QODER_CHAT_URL, body, extra_headers):
@@ -559,20 +594,36 @@ async def _non_stream_response(sess, body, extra_headers, req_id, created, model
             if not delta: continue
             if delta.get("content"): full_text += delta["content"]
             if delta.get("tool_calls") and len(delta["tool_calls"]) > 0: tc_acc.append(delta["tool_calls"])
+    except asyncio.CancelledError:
+        logger.info("Non-stream cancelled (req=%s)", req_id)
+        return JSONResponse(None, status_code=499)
     except Exception as exc:
-        pass
+        logger.error("Non-stream error for req=%s: %s", req_id, exc, exc_info=True)
+        errored = True
 
     fallback_tc = None
-    if tc_acc.is_empty() and tools_enabled: fallback_tc = _parse_tool_calls_text(full_text)
+    if tc_acc.is_empty() and tools_enabled:
+        fallback_tc = _parse_tool_calls_text(full_text)
 
     msg = {"role": "assistant"}
-    if fallback_tc: msg["content"] = None; msg["tool_calls"] = fallback_tc
-    elif not full_text and not tc_acc.is_empty(): msg["content"] = None
-    else: msg["content"] = full_text
-    if not tc_acc.is_empty(): msg["tool_calls"] = tc_acc.snapshot()
+    if fallback_tc:
+        msg["content"] = None
+        msg["tool_calls"] = fallback_tc
+    elif not full_text and not tc_acc.is_empty():
+        msg["content"] = None
+    else:
+        msg["content"] = full_text
+    if not tc_acc.is_empty():
+        msg["tool_calls"] = tc_acc.snapshot()
 
     finish_reason = "tool_calls" if (not tc_acc.is_empty() or fallback_tc) else "stop"
     usage = _build_usage(prompt, full_text)
+
+    elapsed = time.time() - t0
+    logger.info("Non-stream complete req=%s finish=%s tokens=%d elapsed=%.1f%s",
+                req_id, finish_reason, usage["total_tokens"], elapsed,
+                " ERR" if errored else "")
+
     return JSONResponse({"id": req_id, "object": "chat.completion", "created": created, "model": model,
                           "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
                           "usage": usage})

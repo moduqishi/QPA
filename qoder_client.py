@@ -1,6 +1,7 @@
 """Qoder API client — ported from SignatureApiClient + BearerApiClient + JobTokenClient"""
 
 import json
+import logging
 import time
 from typing import Any
 
@@ -16,6 +17,8 @@ from .bearer import (
 )
 from .encoding import encode as qoder_encode
 from .signature import APPCODE, current_date, sign
+
+logger = logging.getLogger("qpa.qoder")
 
 
 def exchange_job_token(pat: str) -> dict:
@@ -134,6 +137,9 @@ async def open_stream(sess: SessionContext, url: str, body_obj: dict, extra_head
     headers["authorization"] = bearer
     headers["cosy-date"] = cosy_date
 
+    
+    logger.debug("Qoder stream POST %s body_len=%d", url, len(body))
+
     # read=None: never timeout waiting for the next chunk from the upstream model
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(connect=30, read=None, write=30, pool=30)
@@ -141,7 +147,14 @@ async def open_stream(sess: SessionContext, url: str, body_obj: dict, extra_head
         async with client.stream("POST", url, content=body, headers=headers) as resp:
             if resp.status_code != 200:
                 err = await resp.aread()
-                raise RuntimeError(f"HTTP {resp.status_code} body={err.decode()}")
+                msg = f"Qoder HTTP {resp.status_code} body={err.decode()}"
+                logger.error(msg)
+                raise RuntimeError(msg)
+
+            line_count = 0
             async for line in resp.aiter_lines():
                 if line:
+                    line_count += 1
                     yield line
+
+            logger.debug("Qoder stream done: %d lines", line_count)

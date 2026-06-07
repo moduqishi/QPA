@@ -1,0 +1,43 @@
+
+<h2>页面导航结构</h2>
+<p class="subtitle">QPA 管理面板有 7 个功能模块，怎么组织它们？点击选择你喜欢的布局。</p>
+
+<div class="options">
+
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>左侧导航栏（经典后台）</h3>
+      <p>左侧固定侧边栏，顶部放 Logo 和 QPA 标题，下面依次是：仪表盘、账号管理、API 密钥、请求历史、用量统计、日志、系统设置。主内容区在右侧。</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>优点</h4><ul><li>最经典的管理后台布局，用户零学习成本</li><li>导航始终可见，切换页面快</li><li>Naive UI 的 NLayout + NMenu 原生支持</li></ul></div>
+        <div class="cons"><h4>缺点</h4><ul><li>侧边栏占约 200-240px 宽度，小屏幕可用空间减少</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>顶部导航栏</h3>
+      <p>顶部水平导航条，放 Logo + 7 个 Tab 页签。主内容区全宽展示。导航栏固定在顶部。</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>优点</h4><ul><li>主内容区全宽，表格和图表空间大</li><li>视觉更简洁</li></ul></div>
+        <div class="cons"><h4>缺点</h4><ul><li>7 个 Tab 在移动端可能溢出，需要折叠菜单</li><li>顶部高度有限，扩展性差</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>左侧导航 + 仪表盘首页（推荐）</h3>
+      <p>和 A 类似的左侧导航，但默认首页是「仪表盘」— 一个聚合了核心指标（今日调用、token 用量、账号状态、最近请求）的概览页面。其他模块通过侧边栏进入。</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>优点</h4><ul><li>经典布局 + 信息聚合首页，打开就能看到全貌</li><li>仪表盘可放图表趋势，一目了然</li><li>最适合日常运维场景</li></ul></div>
+        <div class="cons"><h4>缺点</h4><ul><li>仪表盘开发量稍大，但价值最高</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+</div>

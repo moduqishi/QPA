@@ -1,7 +1,22 @@
 """Entry point: python run.py"""
 
+import logging
 import sys
 from pathlib import Path
+
+
+# ── Logging configuration ───────────────────────────────────────────
+# Set level to DEBUG to see every request and upstream response chunk.
+# In production you can change back to INFO.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Quiet down noisy libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 
 def _resolve_config_path() -> Path:
@@ -34,4 +49,6 @@ else:
 if __name__ == "__main__":
     import uvicorn
     from QPA.main import app
-    uvicorn.run(app, host=host, port=port, reload=False)
+    # Let uvicorn inherit our logger config
+    uvicorn.run(app, host=host, port=port, reload=False,
+                log_level="info", access_log=False)

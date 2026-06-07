@@ -1,0 +1,126 @@
+
+<h2>仪表盘首页布局</h2>
+<p class="subtitle">打开管理面板后第一眼看到的页面，应该展示什么？</p>
+
+<div class="split">
+
+  <div class="mockup" data-choice="layout-a" onclick="toggleSelect(this)">
+    <div class="mockup-header">方案 A：指标卡片 + 趋势图</div>
+    <div class="mockup-body" style="background:#1a1d27;padding:20px;font-family:sans-serif;color:#e1e4ed;">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-bottom:20px;">
+        <div style="background:#232736;border-radius:10px;padding:14px;text-align:center;border:1px solid #2e3347;">
+          <div style="font-size:24px;font-weight:700;color:#00b894;">1,234</div>
+          <div style="font-size:11px;color:#8b8fa3;margin-top:4px;">今日调用</div>
+        </div>
+        <div style="background:#232736;border-radius:10px;padding:14px;text-align:center;border:1px solid #2e3347;">
+          <div style="font-size:24px;font-weight:700;color:#6c5ce7;">56.7K</div>
+          <div style="font-size:11px;color:#8b8fa3;margin-top:4px;">今日 Token</div>
+        </div>
+        <div style="background:#232736;border-radius:10px;padding:14px;text-align:center;border:1px solid #2e3347;">
+          <div style="font-size:24px;font-weight:700;color:#a29bfe;">3/5</div>
+          <div style="font-size:11px;color:#8b8fa3;margin-top:4px;">活跃账号</div>
+        </div>
+        <div style="background:#232736;border-radius:10px;padding:14px;text-align:center;border:1px solid #2e3347;">
+          <div style="font-size:24px;font-weight:700;color:#fdcb6e;">99.2%</div>
+          <div style="font-size:11px;color:#8b8fa3;margin-top:4px;">成功率</div>
+        </div>
+      </div>
+      <div style="background:#232736;border-radius:10px;padding:16px;border:1px solid #2e3347;margin-bottom:16px;">
+        <div style="font-size:13px;color:#8b8fa3;margin-bottom:12px;">调用量趋势（近 7 天）</div>
+        <div style="height:120px;background:linear-gradient(135deg,rgba(108,92,231,0.1),rgba(162,155,254,0.05));border-radius:8px;display:flex;align-items:flex-end;padding:10px;gap:4px;">
+          <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:4px 4px 0 0;height:40%;"></div>
+          <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:4px 4px 0 0;height:55%;"></div>
+          <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:4px 4px 0 0;height:35%;"></div>
+          <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:4px 4px 0 0;height:70%;"></div>
+          <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:4px 4px 0 0;height:85%;"></div>
+          <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:4px 4px 0 0;height:60%;"></div>
+          <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:4px 4px 0 0;height:90%;"></div>
+        </div>
+      </div>
+      <div style="background:#232736;border-radius:10px;padding:16px;border:1px solid #2e3347;">
+        <div style="font-size:13px;color:#8b8fa3;margin-bottom:12px;">最近请求</div>
+        <div style="font-size:12px;color:#8b8fa3;">
+          <div style="display:grid;grid-template-columns:80px 1fr 80px 60px;gap:8px;padding:6px 0;border-bottom:1px solid #2e3347;">
+            <span>14:32:01</span><span style="color:#e1e4ed;">qmodel_latest</span><span>2,341 tok</span><span style="color:#00b894;">OK</span>
+          </div>
+          <div style="display:grid;grid-template-columns:80px 1fr 80px 60px;gap:8px;padding:6px 0;border-bottom:1px solid #2e3347;">
+            <span>14:31:55</span><span style="color:#e1e4ed;">lite</span><span>892 tok</span><span style="color:#00b894;">OK</span>
+          </div>
+          <div style="display:grid;grid-template-columns:80px 1fr 80px 60px;gap:8px;padding:6px 0;">
+            <span>14:31:48</span><span style="color:#e1e4ed;">qmodel_latest</span><span>1,102 tok</span><span style="color:#00b894;">OK</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup" data-choice="layout-b" onclick="toggleSelect(this)">
+    <div class="mockup-header">方案 B：指标卡片 + 双列图表</div>
+    <div class="mockup-body" style="background:#1a1d27;padding:20px;font-family:sans-serif;color:#e1e4ed;">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-bottom:20px;">
+        <div style="background:#232736;border-radius:10px;padding:14px;text-align:center;border:1px solid #2e3347;">
+          <div style="font-size:24px;font-weight:700;color:#00b894;">1,234</div>
+          <div style="font-size:11px;color:#8b8fa3;margin-top:4px;">今日调用</div>
+        </div>
+        <div style="background:#232736;border-radius:10px;padding:14px;text-align:center;border:1px solid #2e3347;">
+          <div style="font-size:24px;font-weight:700;color:#6c5ce7;">56.7K</div>
+          <div style="font-size:11px;color:#8b8fa3;margin-top:4px;">今日 Token</div>
+        </div>
+        <div style="background:#232736;border-radius:10px;padding:14px;text-align:center;border:1px solid #2e3347;">
+          <div style="font-size:24px;font-weight:700;color:#a29bfe;">3/5</div>
+          <div style="font-size:11px;color:#8b8fa3;margin-top:4px;">活跃账号</div>
+        </div>
+        <div style="background:#232736;border-radius:10px;padding:14px;text-align:center;border:1px solid #2e3347;">
+          <div style="font-size:24px;font-weight:700;color:#fdcb6e;">99.2%</div>
+          <div style="font-size:11px;color:#8b8fa3;margin-top:4px;">成功率</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+        <div style="background:#232736;border-radius:10px;padding:16px;border:1px solid #2e3347;">
+          <div style="font-size:13px;color:#8b8fa3;margin-bottom:12px;">调用量趋势</div>
+          <div style="height:100px;background:linear-gradient(135deg,rgba(108,92,231,0.1),rgba(162,155,254,0.05));border-radius:8px;display:flex;align-items:flex-end;padding:10px;gap:3px;">
+            <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:3px 3px 0 0;height:40%;"></div>
+            <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:3px 3px 0 0;height:55%;"></div>
+            <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:3px 3px 0 0;height:35%;"></div>
+            <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:3px 3px 0 0;height:70%;"></div>
+            <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:3px 3px 0 0;height:85%;"></div>
+            <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:3px 3px 0 0;height:60%;"></div>
+            <div style="flex:1;background:linear-gradient(180deg,#6c5ce7,#a29bfe);border-radius:3px 3px 0 0;height:90%;"></div>
+          </div>
+        </div>
+        <div style="background:#232736;border-radius:10px;padding:16px;border:1px solid #2e3347;">
+          <div style="font-size:13px;color:#8b8fa3;margin-bottom:12px;">Token 用量分布</div>
+          <div style="height:100px;display:flex;align-items:center;justify-content:center;">
+            <div style="width:80px;height:80px;border-radius:50%;background:conic-gradient(#6c5ce7 0% 45%,#a29bfe 45% 75%,#00b894 75% 90%,#fdcb6e 90% 100%);"></div>
+          </div>
+        </div>
+      </div>
+      <div style="background:#232736;border-radius:10px;padding:16px;border:1px solid #2e3347;">
+        <div style="font-size:13px;color:#8b8fa3;margin-bottom:8px;">账号状态</div>
+        <div style="font-size:12px;">
+          <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #2e3347;">
+            <span style="width:8px;height:8px;border-radius:50%;background:#00b894;display:inline-block;"></span>
+            <span style="color:#e1e4ed;">main</span><span style="color:#8b8fa3;margin-left:auto;">剩余 450</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #2e3347;">
+            <span style="width:8px;height:8px;border-radius:50%;background:#fdcb6e;display:inline-block;"></span>
+            <span style="color:#e1e4ed;">backup</span><span style="color:#8b8fa3;margin-left:auto;">剩余 12</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;padding:6px 0;">
+            <span style="width:8px;height:8px;border-radius:50%;background:#e17055;display:inline-block;"></span>
+            <span style="color:#e1e4ed;">test</span><span style="color:#8b8fa3;margin-left:auto;">已耗尽</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div style="margin-top:24px;padding:16px;background:#232736;border-radius:10px;border:1px solid #2e3347;">
+  <h3 style="color:#e1e4ed;margin-bottom:8px;">两个方案的差异</h3>
+  <p style="color:#8b8fa3;font-size:14px;line-height:1.8;">
+    <strong style="color:#e1e4ed;">方案 A：</strong>单列布局，调用量趋势占满宽度，下方紧跟最近请求列表。信息密度高，一屏看完。<br>
+    <strong style="color:#e1e4ed;">方案 B：</strong>双列布局，调用量趋势和 Token 分布并排，下方是账号状态列表。视觉更平衡，但单张图表空间较小。
+  </p>
+</div>
