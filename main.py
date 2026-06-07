@@ -262,31 +262,48 @@ def _convert_openai_contents_to_qoder(message: dict) -> dict:
 
 
 TOOL_INSTRUCTION = (
-    "You have tools available. When the user asks you to do something - read files, write code, "
-    "run commands, modify projects - you MUST use the tools to actually do it. "
-    "Do NOT just describe what you would do. Do NOT output a plan without executing steps. "
-    "Call the appropriate tool directly instead of narrating your intent. "
-    "After each tool result, decide the next action and take it immediately.\n\n"
-    "--- TOOL CALL FORMAT ---\n"
-    "When you need to call tools, output them in this EXACT format:\n"
-    "Tool calls:\n"
-    "\"\"\"json\n"
-    "[{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"tool_name\", \"arguments\": \"{...}\"}}]\n"
-    "\"\"\"\n"
-    "---\n"
-    "NEVER reply with just a plan or description. Call a tool immediately.\n"
-    "If you catch yourself starting a sentence with \"I will\" or \"Let me\", STOP and call a tool instead."
+    "You MUST use the available tools to complete the task. Call tools directly — "
+    "do not describe what you would do, do not plan, do not narrate.\n"
+    "Each tool response gives you results you need for the next step. "
+    "Keep taking action until the task is done."
 )
 
 def _build_qoder_messages(template_messages: list, incoming_messages: list[dict],
                           prompt: str, tools_enabled: bool, image_urls: list[str],
                           incoming_tools: list | None = None) -> list[dict]:
     rebuilt: list[dict] = []
-    # Inject a tool-use primer as the first system message when tools are available.
-    # This is separate from Codex's own system prompt and tells Qwen-adapted models
-    # to call tools instead of narrating intent.
+    
+    # Build the tool description text that will be injected into user messages.
+    # Qwen needs tool definitions in visible text — the body["tools"] field may
+    # not be surfaced to the model by Qoder's API layer.
+    tool_desc_text = ""
+    if tools_enabled and incoming_tools:
+        lines = []
+        for t in incoming_tools:
+            f = t.get("function", {})
+            name = f.get("name", "?")
+            desc = f.get("description", "").split(". ")[0]  # first sentence only
+            params = f.get("parameters", {})
+            props = params.get("properties", {}) if isinstance(params, dict) else {}
+            arg_names = ", ".join(props.keys()) if props else ""
+            if arg_names:
+                lines.append(f"  {name}({arg_names}): {desc}")
+            else:
+                lines.append(f"  {name}: {desc}")
+        tool_names = ", ".join(t.get("function", {}).get("name", "?") for t in incoming_tools)
+        tool_desc_text = (
+            "\n[AVAILABLE TOOLS]\n"
+            + "\n".join(lines) + "\n"
+            + "Call them via: Tool calls:\n```json\n[{\"id\": \"call_...\", \"type\": \"function\", \"function\": {\"name\": \"TOOL_NAME\", \"arguments\": \"{...}\"}}]\n```\n"
+            "CRITICAL: Call a tool NOW. Do NOT describe what you will do."
+        )
+    
+    # Always inject tool instruction(s) as the first system message.
+    # This sets the behavior for the entire conversation.
     if tools_enabled:
-        rebuilt.append({"role": "system", "content": TOOL_INSTRUCTION})
+        rebuilt.append({"role": "system", "content": TOOL_INSTRUCTION + tool_desc_text})
+    
+    # Include template system messages if Codex hasn't already provided one.
     keep_sys = not _has_role(incoming_messages, "system")
     if keep_sys:
         for msg in template_messages:
@@ -322,70 +339,25 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
     if not rebuilt and prompt.strip():
         rebuilt.append(_build_user_message(prompt))
     
-    # ---- Context management for long conversations ----
-    # Qwen-adapted models lose tool-calling ability in long contexts.
-    # We keep only the most recent turns + all system messages.
-    if tools_enabled and len(rebuilt) > 35:
-        # Find the last system message index
-        last_sys = -1
-        for j in range(len(rebuilt) - 1, -1, -1):
-            if rebuilt[j].get("role") == "system":
-                last_sys = j
-                break
-        # Keep system messages (0..last_sys) + last 25 messages
-        keep_start = max(last_sys + 1, len(rebuilt) - 25)
-        if keep_start > last_sys + 1:
-            # Add a summary message so the model doesn't lose context entirely
-            rebuilt = rebuilt[:last_sys + 1] + [
-                {"role": "system", "content": (
-                    "[Earlier conversation truncated to keep context fresh. "
-                    "Continue with the current task using available tools.]"
-                )}
-            ] + rebuilt[keep_start:]
-    
-    # Inject tool definitions + format reminder near the last user message.
-    # This is the most critical fix: Qwen needs the actual tool names/descriptions
-    # visible in its immediate context, not just in body["tools"].
-    if tools_enabled and len(rebuilt) >= 3 and incoming_tools:
-        # Build a compact tool listing for the model
-        tool_desc_lines = []
-        for t in incoming_tools:
-            tfunc = t.get("function", {})
-            tname = tfunc.get("name", "?")
-            tdesc = tfunc.get("description", "")
-            tparams = tfunc.get("parameters", {})
-            props = tparams.get("properties", {}) if isinstance(tparams, dict) else {}
-            tprops = ", ".join(props.keys()) if props else ""
-            if tprops:
-                tool_desc_lines.append(f"  {tname}({tprops}): {tdesc}")
-            else:
-                tool_desc_lines.append(f"  {tname}: {tdesc}")
-        tool_names = [t.get("function", {}).get("name", "?") for t in incoming_tools]
-        tools_text = "\n".join(tool_desc_lines)
-        tool_names_str = ", ".join(tool_names)
-        
-        reminder_content = (
-            "IMPORTANT: You MUST use tools to do the work. Available tools: " + tool_names_str + ".\n"
-            "Tool definitions:\n" + tools_text + "\n\n"
-            "Call format:\n"
-            "Tool calls:\n"
-            "\"\"\"json\n"
-            "[{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"TOOL_NAME\", \"arguments\": \"{...json args...}\"}}]\n"
-            "\"\"\"\n\n"
-            "CRITICAL: Do NOT describe what you will do. Call the tool NOW."
-        )
-        
-        # Find last user message index
-        last_ui = None
+    # ---- Inject tool definitions into the LAST user message text ----
+    # This is critical: Qwen needs to see tool names/descriptions RIGHT BEFORE
+    # it decides to respond.  Putting it in the last user message guarantees
+    # the model sees it at decision time, no matter how long the conversation.
+    if tools_enabled and tool_desc_text and len(rebuilt) >= 2:
         for j in range(len(rebuilt) - 1, -1, -1):
             if rebuilt[j].get("role") == "user":
-                last_ui = j
+                msg = rebuilt[j]
+                existing = _normalize_message_text(msg)
+                # Append tool listing into the user message text
+                enriched = existing + tool_desc_text
+                msg["content"] = enriched
+                # Also update contents for Qoder's dual-field format
+                if msg.get("contents") and isinstance(msg["contents"], list):
+                    for c in msg["contents"]:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            c["text"] = enriched
+                            break
                 break
-        if last_ui is not None and last_ui > 0:
-            rebuilt.insert(last_ui, {
-                "role": "system",
-                "content": reminder_content,
-            })
     
     return rebuilt
 
@@ -573,13 +545,8 @@ async def chat_completions(request: Request):
     # top level, NOT in the messages array, so it won't get truncated in long convs.
     if tools_enabled:
         ctx["chatPrompt"] = (
-            "CRITICAL: You MUST call tools to do the work. Never just describe what you would do.\n"
-            "Output tool calls in this format:\n"
-            "Tool calls:\n"
-            "\"\"\"json\n"
-            "[...tool call json...]\n"
-            "\"\"\"\n"
-            "If you start typing 'I will' or 'Let me', STOP and call a tool directly instead."
+            "Call tools now — do NOT describe what you will do.\n"
+            "Format: Tool calls:\n\"\"\"json\n[...tool calls...]\n\"\"\""
         )
     body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls, incoming_tools)
     if tools_enabled:
