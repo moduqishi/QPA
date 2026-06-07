@@ -702,6 +702,8 @@ async def chat_completions(request: Request):
     body["session_id"] = str(uuid.uuid4())
     body["stream"] = True
     body["aliyun_user_type"] = sess.identity.user_type
+    body["session_type"] = "openai"
+    body["source"] = 2
 
     mc = body.get("model_config", {})
     mc["key"] = model
@@ -837,17 +839,20 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
 
     try:
         pending_buf = ""
+        tc_mode = False
+        text_before_tc = ""
+        after_tc = ""
         line_count = 0
+        
         async for line in open_stream(sess, QODER_CHAT_URL, body, extra_headers):
             if not line.startswith("data:"): continue
             line_count += 1
             raw_data = line[5:].strip()
-            # Log first few non-[DONE] chunks to debug Qoder's response format
             if line_count <= 5 and "[DONE]" not in raw_data:
                 logger.debug("RAW chunk #%d: %.400s", line_count, raw_data)
             delta = _extract_delta(raw_data)
             if not delta:
-                logger.debug("_extract_delta returned empty for: %.200s", raw_data)
+                logger.debug("_extract_delta empty: %.200s", raw_data)
                 continue
 
             d_role, d_content, d_reasoning = delta.get("role", ""), delta.get("content", ""), delta.get("reasoning_content", "")
@@ -859,7 +864,14 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
                 full_content += d_reasoning
                 continue
 
+            # Structured tool_calls from delta — direct path
             if d_tc and len(d_tc) > 0:
+                if pending_buf:
+                    full_content += pending_buf
+                    yield _emit_chunk(content=pending_buf, role=pending_role if not emitted_chunk else None)
+                    emitted_chunk = True
+                    pending_buf = ""
+                    tc_mode = False
                 tc_acc.append(d_tc)
                 yield _emit_chunk(role=pending_role if not emitted_chunk else None, tc=_with_tc_indices(d_tc))
                 emitted_chunk = True
@@ -873,24 +885,23 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
                 emitted_chunk = True
                 continue
 
-            # Buffer and scan for "Tool calls:" pattern.
-            # Qwen may output tool calls as text instead of structured tool_calls.
+            # Text-based tool call detection
+            # Model outputs "Tool calls:\n```json\n[...]```" as text content
             pending_buf += d_content
-            tc_idx = pending_buf.find("Tool calls:")
 
-            if tc_idx >= 0 and len(pending_buf) >= tc_idx + 11:
-                # Found "Tool calls:" in buffer.
-                # Emit any text before it
-                if tc_idx > 0:
-                    text_before = pending_buf[:tc_idx]
-                    full_content += text_before
-                    yield _emit_chunk(content=text_before, role=pending_role if not emitted_chunk else None)
+            if not tc_mode:
+                tc_idx = pending_buf.find("Tool calls:")
+                if tc_idx >= 0:
+                    tc_mode = True
+                    text_before_tc = pending_buf[:tc_idx]
+                    after_tc = pending_buf[tc_idx + 11:]
+                elif len(pending_buf) >= 400:
+                    full_content += pending_buf
+                    yield _emit_chunk(content=pending_buf, role=pending_role if not emitted_chunk else None)
                     emitted_chunk = True
-
-                # The rest after "Tool calls:" may contain markdown-styled JSON
-                after_tc = pending_buf[tc_idx + 11:]
-
-                # Try to find and parse JSON array
+                    pending_buf = ""
+            else:
+                after_tc += d_content
                 json_start = after_tc.find("[")
                 if json_start >= 0:
                     depth = 0
@@ -908,10 +919,13 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
                             calls = json.loads(after_tc[json_start:json_end])
                             norm = _normalize_tool_calls(calls)
                             if norm:
+                                if text_before_tc.strip():
+                                    full_content += text_before_tc
+                                    yield _emit_chunk(content=text_before_tc, role=pending_role if not emitted_chunk else None)
+                                    emitted_chunk = True
                                 tc_acc.append(norm)
                                 yield _emit_chunk(role=pending_role if not emitted_chunk else None, tc=_with_tc_indices(norm))
                                 emitted_chunk = True
-                                # Remaining content after the JSON
                                 rest = after_tc[json_end:].strip().lstrip('```').strip()
                                 if rest.startswith('\n'):
                                     rest = rest[1:].strip()
@@ -920,32 +934,27 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
                                     yield _emit_chunk(content=rest)
                                     emitted_chunk = True
                                 pending_buf = ""
+                                tc_mode = False
                                 continue
                         except json.JSONDecodeError:
                             pass
+                if len(after_tc) > 8000:
+                    all_text = text_before_tc + "Tool calls:" + after_tc
+                    full_content += all_text
+                    yield _emit_chunk(content=all_text, role=pending_role if not emitted_chunk else None)
+                    emitted_chunk = True
+                    pending_buf = ""
+                    tc_mode = False
 
-                # JSON parsing failed — emit all as text
-                all_text = pending_buf[:tc_idx] + "Tool calls:" + after_tc
+        if pending_buf:
+            if tc_mode:
+                all_text = text_before_tc + "Tool calls:" + after_tc
                 full_content += all_text
                 yield _emit_chunk(content=all_text, role=pending_role if not emitted_chunk else None)
-                emitted_chunk = True
-                pending_buf = ""
-                continue
-
-            # No "Tool calls:" detected yet. Buffer up to 200 chars then flush.
-            # This keeps streaming responsive while catching split patterns.
-            if len(pending_buf) >= 200:
+            else:
                 full_content += pending_buf
                 yield _emit_chunk(content=pending_buf, role=pending_role if not emitted_chunk else None)
-                emitted_chunk = True
-                pending_buf = ""
-
-        # Flush any remaining buffer
-        if pending_buf:
-            full_content += pending_buf
-            yield _emit_chunk(content=pending_buf, role=pending_role if not emitted_chunk else None)
             emitted_chunk = True
-
     except asyncio.CancelledError:
         logger.info("Stream cancelled (req=%s)", req_id)
         return
@@ -984,13 +993,16 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
         return
 
     # ---- Normal end of stream ----
-    # The mid-stream handler above should have caught all tool calls,
-    # but as a fallback, scan full_content for any we missed.
-    if tools_enabled and tc_acc.is_empty():
+    # Always scan full_content for missed text-based tool calls.
+    # This catches cases where 'Tool calls:' appeared but the
+    # streaming handler's buffer didn't capture the full JSON.
+    if tools_enabled:
         parsed_tc = _parse_tool_calls_text(full_content)
         if parsed_tc:
             tc_acc.append(parsed_tc)
-            yield _emit_chunk(tc=_with_tc_indices(parsed_tc))
+            if not emitted_chunk:
+                yield _emit_chunk(tc=_with_tc_indices(parsed_tc))
+                emitted_chunk = True
 
     finish_reason = "tool_calls" if not tc_acc.is_empty() else "stop"
     final = _make_chunk(req_id, created, model)
