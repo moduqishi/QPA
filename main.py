@@ -39,7 +39,6 @@ async def startup():
 
 
 async def _process_images(sess: SessionContext, messages: list[dict]) -> tuple[list[dict], list[str]]:
-    """Collect image URLs from messages without upload -- Qoder accepts data: URLs directly."""
     image_urls: list[str] = []
     new_messages = copy.deepcopy(messages)
 
@@ -208,7 +207,6 @@ def _convert_incoming_message(message: dict, tools_enabled: bool, allow_stc: boo
 
 
 def _convert_openai_contents_to_qoder(message: dict) -> dict:
-    """Convert OpenAI multimodal content array to Qoder contents format, preserving image_url."""
     content = message.get("content")
     if not isinstance(content, list):
         return message
@@ -295,9 +293,39 @@ def _extract_delta(data_line: str) -> dict:
             if role or content or reasoning or (tc and len(tc) > 0):
                 return {"role": role, "content": content, "reasoning_content": reasoning, "tool_calls": tc}
     except json.JSONDecodeError as e:
-        logger.warning("_extract_delta json error: %s | data_line[:200]=%s", e, data_line[:200])
+        pass
     except Exception as e:
-        logger.warning("_extract_delta error: %s", e)
+        pass
+    return {}
+
+
+_log_done_warning = False
+
+def _extract_delta_debug(data_line: str, logger) -> dict:
+    """Like _extract_delta but logs on parse failure to help debug Qoder format."""
+    global _log_done_warning
+    try:
+        wrapper = json.loads(data_line)
+        inner = wrapper.get("body", "")
+        if not inner: return {}
+        # If inner is the literal string "[DONE]", skip silently
+        if inner.strip() == "[DONE]":
+            return {}
+        inner_json = json.loads(inner)
+        for ch in inner_json.get("choices", []):
+            delta = ch.get("delta", {})
+            role = delta.get("role", "")
+            content = delta.get("content", "")
+            reasoning = delta.get("reasoning_content", "")
+            tc = delta.get("tool_calls")
+            if role or content or reasoning or (tc and len(tc) > 0):
+                return {"role": role, "content": content, "reasoning_content": reasoning, "tool_calls": tc}
+    except json.JSONDecodeError:
+        if not _log_done_warning:
+            logger.info("Qoder SSE format (sample): %s", data_line[:200])
+            _log_done_warning = True
+    except Exception:
+        pass
     return {}
 
 
@@ -337,15 +365,8 @@ def _build_usage(prompt_text: str, completion_text: str) -> dict:
 
 
 def _usage_chunk(req_id: str, created: int, model: str, usage: dict) -> str:
-    chunk = {
-        "id": req_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [],
-        "usage": usage,
-    }
-    return _sse_line(chunk)
+    return _sse_line({"id": req_id, "object": "chat.completion.chunk", "created": created,
+                       "model": model, "choices": [], "usage": usage})
 
 
 # ─── API Endpoints ───
@@ -378,7 +399,7 @@ async def chat_completions(request: Request):
     n_msgs = len(messages)
     tools_list = req.get("tools")
     has_tools = bool(tools_list)
-    logger.info("POST /v1/chat/completions model=%s msgs=%d tools=%d stream=%s",
+    logger.info("POST model=%s msgs=%d tools=%d stream=%s",
                 model, n_msgs, len(tools_list) if tools_list else 0, stream)
 
     processed_messages, image_urls = await _process_images(sess, messages)
@@ -439,15 +460,17 @@ async def chat_completions(request: Request):
     req_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
 
+    # Reset per-request warning flag
+    global _log_done_warning
+    _log_done_warning = False
+
     if stream:
-        response = StreamingResponse(
+        return StreamingResponse(
             _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, include_usage, t0),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"})
-        return response
     else:
-        result = await _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, t0)
-        return result
+        return await _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, t0)
 
 
 def _load_template() -> dict:
@@ -463,15 +486,12 @@ def _load_template() -> dict:
 
 
 async def _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, include_usage, t0):
-    """Async SSE streaming response — forward reasoning_content as well to keep Codex's
-    SSE parser alive during long thinking phases.  Signal truncated responses honestly."""
     tc_acc = ToolCallAccumulator()
     pending_content = ""
     pending_role = "assistant"
     emitted_chunk = False
     streaming_text = False
     full_content = ""
-    errored = False
 
     def _is_potential_tc_text(text: str) -> bool:
         candidate = text.lstrip()
@@ -497,7 +517,7 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
     try:
         async for line in open_stream(sess, QODER_CHAT_URL, body, extra_headers):
             if not line.startswith("data:"): continue
-            delta = _extract_delta(line[5:].strip())
+            delta = _extract_delta_debug(line[5:].strip(), logger)
             if not delta: continue
 
             d_role, d_content, d_reasoning = delta.get("role", ""), delta.get("content", ""), delta.get("reasoning_content", "")
@@ -505,9 +525,7 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
 
             if d_role: pending_role = d_role
 
-            # reasoning-only chunks — we forward them as content to keep the SSE stream alive
             if d_reasoning and not d_content and not d_tc:
-                # Accumulate for final usage, but don't expose to client as content
                 full_content += d_reasoning
                 continue
 
@@ -541,11 +559,10 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
             pending_content = ""
 
     except asyncio.CancelledError:
-        logger.info("Stream cancelled by client (req=%s)", req_id)
+        logger.info("Stream cancelled (req=%s)", req_id)
         return
     except Exception as exc:
-        logger.error("Stream error for req=%s: %s", req_id, exc, exc_info=True)
-        errored = True
+        logger.error("Stream error (req=%s): %s", req_id, exc, exc_info=True)
         if pending_content:
             yield _emit_chunk(content=pending_content)
             full_content += pending_content
@@ -578,8 +595,9 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
     yield "data: [DONE]\n\n"
 
     elapsed = time.time() - t0
-    logger.info("Stream complete req=%s finish=%s tokens=%d elapsed=%.1fs",
-                req_id, finish_reason, _estimate_tokens(full_content), elapsed)
+    content_preview = full_content[:160].replace("\n", "\\n")
+    logger.info("Stream done req=%s finish=%s tokens=%d elapsed=%.1fs content=%s",
+                req_id, finish_reason, _estimate_tokens(full_content), elapsed, content_preview)
 
 
 async def _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, t0):
@@ -590,7 +608,7 @@ async def _non_stream_response(sess, body, extra_headers, req_id, created, model
     try:
         async for line in open_stream(sess, QODER_CHAT_URL, body, extra_headers):
             if not line.startswith("data:"): continue
-            delta = _extract_delta(line[5:].strip())
+            delta = _extract_delta_debug(line[5:].strip(), logger)
             if not delta: continue
             if delta.get("content"): full_text += delta["content"]
             if delta.get("tool_calls") and len(delta["tool_calls"]) > 0: tc_acc.append(delta["tool_calls"])
@@ -598,7 +616,7 @@ async def _non_stream_response(sess, body, extra_headers, req_id, created, model
         logger.info("Non-stream cancelled (req=%s)", req_id)
         return JSONResponse(None, status_code=499)
     except Exception as exc:
-        logger.error("Non-stream error for req=%s: %s", req_id, exc, exc_info=True)
+        logger.error("Non-stream error (req=%s): %s", req_id, exc, exc_info=True)
         errored = True
 
     fallback_tc = None
@@ -620,9 +638,10 @@ async def _non_stream_response(sess, body, extra_headers, req_id, created, model
     usage = _build_usage(prompt, full_text)
 
     elapsed = time.time() - t0
-    logger.info("Non-stream complete req=%s finish=%s tokens=%d elapsed=%.1f%s",
+    content_preview = full_text[:160].replace("\n", "\\n")
+    logger.info("Non-stream done req=%s finish=%s tokens=%d elapsed=%.1f%s content=%s",
                 req_id, finish_reason, usage["total_tokens"], elapsed,
-                " ERR" if errored else "")
+                " ERR" if errored else "", content_preview)
 
     return JSONResponse({"id": req_id, "object": "chat.completion", "created": created, "model": model,
                           "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],

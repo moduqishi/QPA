@@ -1,33 +1,30 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.venv/
-venv/
-env/
-*.egg-info/
-dist/
-build/
 
 # Config with secrets
-config.yaml
-
 # Environment
+# IDE
+# Logs
+# OS
+# Python
+*$py.class
+*.egg-info/
+*.local
+*.log
+*.py[cod]
+*.so
+*.swo
+*.swp
+*~
+.DS_Store
 .env
 .env.*
-*.local
-
-# IDE
-.vscode/
 .idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
+.superpowers
+.venv/
+.vscode/
 Thumbs.db
-
-# Logs
-*.log
+__pycache__/
+build/
+config.yaml
+dist/
+env/
+venv/
