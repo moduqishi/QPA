@@ -35,7 +35,29 @@ async def startup():
     global pool
     pool = PatPool()
     pool._template_base = _load_template()
-    pool.init_all()
+    # Run init in background — don't block server startup on slow
+    # session exchange / quota fetch.  Quota will appear once available.
+    asyncio.create_task(_bg_init())
+
+
+async def _bg_init():
+    """Background initialization — retries quota fetch if it fails initially."""
+    global pool
+    if pool is None:
+        return
+    loop = asyncio.get_running_loop()
+    # Run in executor to avoid blocking the event loop with sync HTTP calls
+    await loop.run_in_executor(None, pool.init_all)
+    # For any account that still has no quota, schedule a retry after 5s
+    stale = [a for a in pool.accounts if a.enabled and a.session and not a.is_expired and a.last_quota is None]
+    if stale:
+        await asyncio.sleep(5)
+        for acc in stale:
+            await loop.run_in_executor(None, pool.refresh_quota, acc)
+            if acc.last_quota is not None:
+                logger.info("Quota fetched on retry for %s", acc.name)
+            else:
+                logger.warning("Quota still unavailable for %s — will retry on next admin refresh", acc.name)
 
 
 async def _process_images(sess: SessionContext, messages: list[dict]) -> tuple[list[dict], list[str]]:

@@ -128,7 +128,11 @@ class PatPool:
             account.session = sess
             account.user_info = jt
             account.is_expired = False
+            # First quota fetch (may fail if session is too fresh)
             self.refresh_quota(account)
+            # Warm up the inference session so the first real request doesn't
+            # trigger a Qoder cold-start / 503.
+            _warmup_session(sess)
             return True
         except Exception as e:
             print(f"[pool] init failed for '{account.name}': {e}")
@@ -316,6 +320,83 @@ def _fetch_user_status(sess: SessionContext, user_id: str) -> dict:
     if resp.status_code != 200:
         raise RuntimeError(f"status HTTP {resp.status_code}")
     return resp.json()
+
+
+def _warmup_session(sess: SessionContext):
+    """Send a minimal inference request to warm up the Qoder session.
+
+    Qoder's inference backend cold-starts on the first request after
+    session exchange. This ping ensures the first real request doesn't
+    trigger a 503 / timeout.
+    """
+    try:
+        import uuid
+        from urllib.parse import urlparse
+
+        warm_body = json.dumps({
+            "request_id": str(uuid.uuid4()),
+            "stream": True,
+            "messages": [{"role": "user", "content": "ping",
+                         "response_meta": {"id": "", "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
+                         "reasoning_content_signature": ""}],
+            "parameters": {"max_tokens": 1, "temperature": 0.0, "context_length": 1000000},
+            "model_config": {"key": "lite", "is_reasoning": False},
+            "chat_context": {
+                "chatPrompt": "",
+                "extra": {
+                    "context": [],
+                    "modelConfig": {"is_reasoning": False, "key": "lite"},
+                    "originalContent": {"type": "text", "text": "ping"},
+                },
+                "text": {"type": "text", "text": "ping"},
+            },
+            "is_reply": True,
+            "is_retry": False,
+            "session_id": str(uuid.uuid4()),
+            "code_language": "",
+            "source": 1,
+            "version": "3",
+            "chat_prompt": "",
+            "aliyun_user_type": sess.identity.user_type,
+            "session_type": "qodercli",
+            "agent_id": "agent_common",
+            "task_id": "common",
+        })
+        body = qoder_encode(warm_body.encode())
+
+        url = "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
+        parsed = urlparse(url)
+        path_sig = parsed.path[5:] if parsed.path.startswith("/algo") else parsed.path
+
+        payload_b64 = build_payload_b64(sess.info)
+        date = str(int(time.time()))
+        sig = sign_request(payload_b64, sess.cosy_key, date, body.decode("latin-1"), path_sig)
+        bearer = compose_bearer(payload_b64, sig)
+
+        headers = {
+            "cosy-data-policy": "AGREE",
+            "content-type": "application/json",
+            "cosy-machinetype": sess.machine_type,
+            "cosy-clienttype": "5",
+            "cosy-user": sess.identity.uid,
+            "cosy-key": sess.cosy_key,
+            "cosy-date": date,
+            "cosy-clientip": "169.254.198.161",
+            "accept": "application/json",
+            "accept-encoding": "identity",
+            "cosy-version": "0.1.43",
+            "cosy-machineid": sess.machine_id,
+            "cosy-machinetoken": sess.machine_token,
+            "login-version": "v2",
+            "user-agent": "Go-http-client/2.0",
+            "authorization": bearer,
+        }
+        resp = httpx.post(url, content=body, headers=headers, timeout=20)
+        if resp.status_code == 200:
+            return
+        print(f"[pool] warm-up returned HTTP {resp.status_code} (non-critical)")
+    except Exception as e:
+        print(f"[pool] warm-up failed (non-critical): {e}")
 
 
 def _fetch_quota(sess: SessionContext) -> dict:
