@@ -634,18 +634,26 @@ async def chat_completions(request: Request):
 
     # Build the messages array first
     body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls, incoming_tools)
-    # chat_context.text: Include tool listing so the model sees available
-    # tools regardless of which Qoder input path is used.
+    # chat_context.text: If Qoder uses this (rather than messages[]) as the
+    # primary model input, the model MUST see the COMPLETE instruction set:
+    # identity, behavioral prompts, tool descriptions, call format, AND task.
     if tools_enabled:
-        ctx_text = ""
+        # Pull system prompt from messages[0] (Codex's native prompt) or fallback
+        sys_text = ""
+        for msg in body.get("messages", []):
+            if msg.get("role") == "system":
+                sys_text = msg.get("content", "")
+                break
+        if not sys_text:
+            sys_text = CODEX_SYSTEM_PROMPT
+        # Append tool descriptions if not already in the prompt
         tt = _get_tool_desc(incoming_tools)
-        if tt:
-            ctx_text = "You have these tools available.\n" + tt
+        if tt and "[TOOLS]" not in sys_text:
+            sys_text += "\n\n" + tt
+        # Append the current task
         if prompt:
-            if ctx_text:
-                ctx_text += "\n\n" + prompt
-            else:
-                ctx_text = prompt
+            sys_text += "\n\nCurrent task: " + prompt
+        ctx_text = sys_text
     else:
         ctx_text = prompt or ""
     if isinstance(ctx.get("text"), dict):
@@ -659,16 +667,23 @@ async def chat_completions(request: Request):
         ctx["imageUrls"] = image_urls
 
 
-    # chatPrompt: Tool listing + brief instruction (covers Qoder input paths
-    # that bypass messages[]).
+    # chatPrompt: Same full context as chat_context.text. Qoder may use either
+    # field as the model's primary input.
     if tools_enabled:
+        sys_text = ""
+        for msg in body.get("messages", []):
+            if msg.get("role") == "system":
+                sys_text = msg.get("content", "")
+                break
+        if not sys_text:
+            sys_text = CODEX_SYSTEM_PROMPT
         tt = _get_tool_desc(incoming_tools)
-        ctx["chatPrompt"] = (
-            "You are a coding assistant. You have tools available.\n" + (tt or "")
-        )
+        if tt and "[TOOLS]" not in sys_text:
+            sys_text += "\n\n" + tt
+        ctx["chatPrompt"] = sys_text
     else:
         ctx["chatPrompt"] = ""
-    body["chat_prompt"] = ""
+    body["chat_prompt"] = ctx["chatPrompt"] if tools_enabled else ""
     if tools_enabled:
         body["tools"] = copy.deepcopy(incoming_tools)
 
