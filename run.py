@@ -3,14 +3,20 @@
 import sys
 from pathlib import Path
 
-_root = Path(__file__).parent.parent
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
 
-import yaml
+def _resolve_config_path() -> Path:
+    """Locate config.yaml: prefer exe directory, fallback to source directory."""
+    if getattr(sys, "frozen", False):
+        # Running as PyInstaller bundle — exe's directory
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).parent
+    return base / "config.yaml"
 
-config_path = Path(__file__).parent / "config.yaml"
+
+config_path = _resolve_config_path()
 if config_path.exists():
+    import yaml
     cfg = yaml.safe_load(config_path.read_text()) or {}
     server = cfg.get("server", {})
     host = server.get("host", "0.0.0.0")

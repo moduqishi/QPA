@@ -1,0 +1,144 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            ext: ''
+          - os: macos-latest
+            target: macos-x86_64
+            ext: ''
+          - os: macos-latest
+            target: macos-arm64
+            ext: ''
+            args: '--target aarch64-apple-darwin'
+          - os: windows-latest
+            target: windows-x86_64
+            ext: '.exe'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build executable (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          pyinstaller --onefile \
+            --name qpa-${{ matrix.target }} \
+            --add-data "baseprompt.json:." \
+            --hidden-import=uvicorn.logging \
+            --hidden-import=uvicorn.loops \
+            --hidden-import=uvicorn.loops.auto \
+            --hidden-import=uvicorn.protocols \
+            --hidden-import=uvicorn.protocols.http \
+            --hidden-import=uvicorn.protocols.http.auto \
+            --hidden-import=uvicorn.protocols.websockets \
+            --hidden-import=uvicorn.protocols.websockets.auto \
+            --hidden-import=uvicorn.protocols.websockets.websockets_impl \
+            --hidden-import=uvicorn.lifespan \
+            --hidden-import=uvicorn.lifespan.on \
+            -y run.py
+
+      - name: Build executable (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --onefile `
+            --name qpa-${{ matrix.target }} `
+            --add-data "baseprompt.json;." `
+            --hidden-import=uvicorn.logging `
+            --hidden-import=uvicorn.loops `
+            --hidden-import=uvicorn.loops.auto `
+            --hidden-import=uvicorn.protocols `
+            --hidden-import=uvicorn.protocols.http `
+            --hidden-import=uvicorn.protocols.http.auto `
+            --hidden-import=uvicorn.protocols.websockets `
+            --hidden-import=uvicorn.protocols.websockets.auto `
+            --hidden-import=uvicorn.protocols.websockets.websockets_impl `
+            --hidden-import=uvicorn.lifespan `
+            --hidden-import=uvicorn.lifespan.on `
+            -y run.py
+
+      - name: Prepare release package (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir release
+          mv dist/qpa-${{ matrix.target }} release/qpa${{ matrix.ext }}
+          cp config.example.yaml release/config.yaml
+          cp README.md release/
+          cd release && tar -czvf ../qpa-${{ matrix.target }}.tar.gz *
+
+      - name: Prepare release package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir release
+          mv dist/qpa-${{ matrix.target }}.exe release/qpa.exe
+          copy config.example.yaml release\config.yaml
+          copy README.md release\
+          cd release && 7z a -tzip ..\qpa-${{ matrix.target }}.zip *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qpa-${{ matrix.target }}
+          path: |
+            qpa-${{ matrix.target }}.tar.gz
+            qpa-${{ matrix.target }}.zip
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir assets
+          find artifacts -name "*.tar.gz" -exec mv {} assets/ \;
+          find artifacts -name "*.zip" -exec mv {} assets/ \;
+          ls -la assets/
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "version=v$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: QPA ${{ steps.version.outputs.version }}
+          prerelease: true
+          generate_release_notes: true
+          files: assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
