@@ -7,12 +7,19 @@ from pathlib import Path
 def _resolve_config_path() -> Path:
     """Locate config.yaml: prefer exe directory, fallback to source directory."""
     if getattr(sys, "frozen", False):
-        # Running as PyInstaller bundle — exe's directory
         base = Path(sys.executable).parent
     else:
         base = Path(__file__).parent
     return base / "config.yaml"
 
+
+# For normal/Docker runs: add the parent of this package dir so `from QPA.xxx` works.
+# e.g. run.py is at /QPA/run.py -> parent.parent = / -> /QPA is importable as QPA.
+# For PyInstaller: the package is frozen in, skip this.
+if not getattr(sys, "frozen", False):
+    _root = str(Path(__file__).parent.parent.resolve())
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
 
 config_path = _resolve_config_path()
 if config_path.exists():

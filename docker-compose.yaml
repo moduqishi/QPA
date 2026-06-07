@@ -6,7 +6,7 @@ services:
     ports:
       - "8963:8963"
     volumes:
-      - ./config.yaml:/app/config.yaml
-      - ./baseprompt.json:/app/baseprompt.json
+      - ./config.yaml:/QPA/config.yaml
+      - ./baseprompt.json:/QPA/baseprompt.json
     environment:
       - TZ=Asia/Shanghai
