@@ -652,19 +652,22 @@ async def chat_completions(request: Request):
     if image_urls:
         ctx["imageUrls"] = image_urls
 
-    # chatPrompt: Brief Qoder-level behavioral instruction.
-    # The full system prompt lives in messages[]; tool definitions in tools[].
-    # chatPrompt is a short reminder, NOT the full prompt.
-    if tools_enabled:
-        ctx["chatPrompt"] = (
-            "You are a coding assistant. Use tools when you need information "
-            "or want to make changes. When a step is done, respond to the user."
-        )
-    else:
-        ctx["chatPrompt"] = ""
-    # chat_prompt (top-level): Keep minimal for compatibility.
-    body["chat_prompt"] = ""
 
+    # chatPrompt AND chat_prompt: Qoder-level system fields.
+    # Set to system prompt + tool listing (NO "Call via" text), so the model
+    # sees available tools but isn't forced to call them every turn.
+    sys_prompt = ""
+    sys_msgs = [m for m in body.get("messages", []) if m.get("role") == "system"]
+    if sys_msgs:
+        sys_prompt = sys_msgs[0].get("content", "")
+    if not sys_prompt:
+        sys_prompt = CODEX_SYSTEM_PROMPT
+    if tools_enabled:
+        tool_text = _get_tool_desc(incoming_tools)
+        if tool_text and "[TOOLS]" not in sys_prompt:
+            sys_prompt += "\n\n" + tool_text
+    ctx["chatPrompt"] = sys_prompt if sys_prompt else ""
+    body["chat_prompt"] = sys_prompt if sys_prompt else ""
     if tools_enabled:
         body["tools"] = copy.deepcopy(incoming_tools)
 
