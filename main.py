@@ -322,7 +322,6 @@ def _get_tool_desc(incoming_tools: list | None) -> str:
     tool_desc = (
         "\n[TOOLS]\n"
         + "\n".join(lines) + "\n"
-        + "To call a tool, respond with:\nTool calls:\n```json\n[{\"id\": \"call_...\", \"function\": {\"name\": \"TOOL_NAME\", \"arguments\": \"{...}\"}}]\n```\n"
     )
     _TOOL_DESC_CACHE = tool_desc
     return tool_desc
@@ -405,23 +404,6 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
         rebuilt.append(_build_user_message(prompt))
 
 
-    # ---- Inject tool descriptions into the LAST user message ----
-    if tools_enabled and len(rebuilt) >= 2:
-        tool_text = _get_tool_desc(incoming_tools)
-        if tool_text:
-            for j in range(len(rebuilt) - 1, -1, -1):
-                if rebuilt[j].get("role") == "user":
-                    existing = rebuilt[j].get("content", "")
-                    if "[TOOLS]" not in existing:
-                        enriched = existing + "\n\n" + tool_text
-                        rebuilt[j]["content"] = enriched
-                        cts = rebuilt[j].get("contents")
-                        if isinstance(cts, list):
-                            for c in cts:
-                                if isinstance(c, dict) and c.get("type") == "text":
-                                    c["text"] = enriched
-                                    break
-                    break
 
     # ---- Truncate long conversations ----
     # Keep: first system message + FIRST user message (the task) + last 5 non-system messages
@@ -652,21 +634,20 @@ async def chat_completions(request: Request):
 
     # Build the messages array first
     body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls, incoming_tools)
-    # chat_context.text: Qoder likely uses this as the primary model input.
-    # Set to system prompt + tool listing + current user prompt.
-    ctx_text = prompt or ""
+    # chat_context.text: Include tool listing so the model sees available
+    # tools regardless of which Qoder input path is used.
     if tools_enabled:
-        for msg in body.get("messages", []):
-            if msg.get("role") == "system":
-                ctx_text = msg.get("content", "")
-                break
-        if not ctx_text:
-            ctx_text = CODEX_SYSTEM_PROMPT
+        ctx_text = ""
         tt = _get_tool_desc(incoming_tools)
-        if tt and "[TOOLS]" not in ctx_text:
-            ctx_text += "\n\n" + tt
+        if tt:
+            ctx_text = "You have these tools available.\n" + tt
         if prompt:
-            ctx_text += "\n\nCurrent task: " + prompt
+            if ctx_text:
+                ctx_text += "\n\n" + prompt
+            else:
+                ctx_text = prompt
+    else:
+        ctx_text = prompt or ""
     if isinstance(ctx.get("text"), dict):
         ctx["text"]["text"] = ctx_text
     if isinstance(extra.get("originalContent"), dict):
@@ -678,21 +659,16 @@ async def chat_completions(request: Request):
         ctx["imageUrls"] = image_urls
 
 
-    # chatPrompt AND chat_prompt: Qoder-level system fields.
-    # Set to system prompt + tool listing (NO "Call via" text), so the model
-    # sees available tools but isn't forced to call them every turn.
-    sys_prompt = ""
-    sys_msgs = [m for m in body.get("messages", []) if m.get("role") == "system"]
-    if sys_msgs:
-        sys_prompt = sys_msgs[0].get("content", "")
-    if not sys_prompt:
-        sys_prompt = CODEX_SYSTEM_PROMPT
+    # chatPrompt: Tool listing + brief instruction (covers Qoder input paths
+    # that bypass messages[]).
     if tools_enabled:
-        tool_text = _get_tool_desc(incoming_tools)
-        if tool_text and "[TOOLS]" not in sys_prompt:
-            sys_prompt += "\n\n" + tool_text
-    ctx["chatPrompt"] = sys_prompt if sys_prompt else ""
-    body["chat_prompt"] = sys_prompt if sys_prompt else ""
+        tt = _get_tool_desc(incoming_tools)
+        ctx["chatPrompt"] = (
+            "You are a coding assistant. You have tools available.\n" + (tt or "")
+        )
+    else:
+        ctx["chatPrompt"] = ""
+    body["chat_prompt"] = ""
     if tools_enabled:
         body["tools"] = copy.deepcopy(incoming_tools)
 
