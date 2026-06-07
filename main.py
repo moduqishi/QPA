@@ -322,7 +322,7 @@ def _get_tool_desc(incoming_tools: list | None) -> str:
     tool_desc = (
         "\n[TOOLS]\n"
         + "\n".join(lines) + "\n"
-        + "Use tools to do work and respond to the user."
+        + 'Call via: Tool calls:\n```json\n[{"id": "call_...", "type": "function", "function": {"name": "TOOL_NAME", "arguments": "{...}"}}]\n```\n'
     )
     _TOOL_DESC_CACHE = tool_desc
     return tool_desc
@@ -645,31 +645,40 @@ async def chat_completions(request: Request):
 
     # Build the messages array first
     body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls, incoming_tools)
-
-    # chat_context.text: This is what Qoder feeds to the model as primary input.
-    # Set to the latest user prompt (the current instruction).
+    # chat_context.text: Set to latest user prompt (current instruction).
+    # This is what Qoder likely feeds as the primary model input.
     # System prompt, tool descriptions, and conversation history are in messages[]
-    # where they belong. chat_context.text is the live task instruction only.
-    chat_context_full = prompt or ""
+    chat_context_text = prompt or ""
     if isinstance(ctx.get("text"), dict):
-        ctx["text"]["text"] = chat_context_full
+        ctx["text"]["text"] = chat_context_text
     if isinstance(extra.get("originalContent"), dict):
-        extra["originalContent"]["text"] = chat_context_full
+        extra["originalContent"]["text"] = chat_context_text
 
     biz["name"] = prompt[:30] if len(prompt) > 30 else prompt
 
     if image_urls:
         ctx["imageUrls"] = image_urls
 
-    # chatPrompt: Qoder-level behavioral instruction set to a balanced
-    # tool-use and response pattern. messages[] carries the full history.
-    # chat_prompt is kept empty for maximum compatibility.
-    ctx["chatPrompt"] = (
-        "You are a coding assistant. Use available tools to do the work. "
-        "When you complete a step, respond to the user. "
-        "Do not call tools if the task is done just respond."
-    )
-    body["chat_prompt"] = ""
+    # chatPrompt AND chat_prompt: Qoder system-level instruction fields.
+    # Set to the system prompt from messages[0] (already enriched with tool
+    # descriptions by _build_qoder_messages). If no system message exists,
+    # use CODEX_SYSTEM_PROMPT + tool descriptions as fallback.
+    # This ensures the model sees tool-use instructions regardless of which
+    # Qoder field it uses as primary input.
+    sys_prompt = ""
+    sys_msgs = [m for m in body.get("messages", []) if m.get("role") == "system"]
+    if sys_msgs:
+        sys_prompt = sys_msgs[0].get("content", "")
+    if not sys_prompt and tools_enabled:
+        sys_prompt = CODEX_SYSTEM_PROMPT
+        tool_text = _get_tool_desc(incoming_tools)
+        if tool_text:
+            sys_prompt += "\n\n" + tool_text
+    if sys_prompt:
+        ctx["chatPrompt"] = sys_prompt
+    else:
+        ctx["chatPrompt"] = ""
+    body["chat_prompt"] = ctx["chatPrompt"]
 
     if tools_enabled:
         body["tools"] = copy.deepcopy(incoming_tools)
