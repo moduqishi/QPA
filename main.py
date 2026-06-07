@@ -282,36 +282,11 @@ def _extract_delta(data_line: str) -> dict:
     try:
         wrapper = json.loads(data_line)
         inner = wrapper.get("body", "")
-        if not inner: return {}
-        inner_json = json.loads(inner)
-        for ch in inner_json.get("choices", []):
-            delta = ch.get("delta", {})
-            role = delta.get("role", "")
-            content = delta.get("content", "")
-            reasoning = delta.get("reasoning_content", "")
-            tc = delta.get("tool_calls")
-            if role or content or reasoning or (tc and len(tc) > 0):
-                return {"role": role, "content": content, "reasoning_content": reasoning, "tool_calls": tc}
-    except json.JSONDecodeError as e:
-        pass
-    except Exception as e:
-        pass
-    return {}
-
-
-_log_done_warning = False
-
-def _extract_delta_debug(data_line: str, logger) -> dict:
-    """Like _extract_delta but logs on parse failure to help debug Qoder format."""
-    global _log_done_warning
-    try:
-        wrapper = json.loads(data_line)
-        inner = wrapper.get("body", "")
-        if not inner: return {}
-        # If inner is the literal string "[DONE]", skip silently
-        if inner.strip() == "[DONE]":
+        if not inner:
             return {}
-        inner_json = json.loads(inner)
+        if isinstance(inner, str) and inner.strip() == "[DONE]":
+            return {}
+        inner_json = json.loads(inner) if isinstance(inner, str) else inner
         for ch in inner_json.get("choices", []):
             delta = ch.get("delta", {})
             role = delta.get("role", "")
@@ -320,10 +295,6 @@ def _extract_delta_debug(data_line: str, logger) -> dict:
             tc = delta.get("tool_calls")
             if role or content or reasoning or (tc and len(tc) > 0):
                 return {"role": role, "content": content, "reasoning_content": reasoning, "tool_calls": tc}
-    except json.JSONDecodeError:
-        if not _log_done_warning:
-            logger.info("Qoder SSE format (sample): %s", data_line[:200])
-            _log_done_warning = True
     except Exception:
         pass
     return {}
@@ -398,7 +369,6 @@ async def chat_completions(request: Request):
 
     n_msgs = len(messages)
     tools_list = req.get("tools")
-    has_tools = bool(tools_list)
     logger.info("POST model=%s msgs=%d tools=%d stream=%s",
                 model, n_msgs, len(tools_list) if tools_list else 0, stream)
 
@@ -460,10 +430,6 @@ async def chat_completions(request: Request):
     req_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
 
-    # Reset per-request warning flag
-    global _log_done_warning
-    _log_done_warning = False
-
     if stream:
         return StreamingResponse(
             _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, include_usage, t0),
@@ -486,12 +452,14 @@ def _load_template() -> dict:
 
 
 async def _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, include_usage, t0):
+    """Async SSE streaming response."""
     tc_acc = ToolCallAccumulator()
     pending_content = ""
     pending_role = "assistant"
     emitted_chunk = False
     streaming_text = False
     full_content = ""
+    truncated = False
 
     def _is_potential_tc_text(text: str) -> bool:
         candidate = text.lstrip()
@@ -517,7 +485,7 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
     try:
         async for line in open_stream(sess, QODER_CHAT_URL, body, extra_headers):
             if not line.startswith("data:"): continue
-            delta = _extract_delta_debug(line[5:].strip(), logger)
+            delta = _extract_delta(line[5:].strip())
             if not delta: continue
 
             d_role, d_content, d_reasoning = delta.get("role", ""), delta.get("content", ""), delta.get("reasoning_content", "")
@@ -562,20 +530,42 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
         logger.info("Stream cancelled (req=%s)", req_id)
         return
     except Exception as exc:
-        logger.error("Stream error (req=%s): %s", req_id, exc, exc_info=True)
+        err_type = type(exc).__name__
+        err_msg = str(exc)[:200]
+        # Check if this is an upstream disconnect (Qoder server dropped connection)
+        is_disconnect = "peer closed connection" in err_msg or "incomplete chunked" in err_msg
+        if is_disconnect:
+            logger.warning("Qoder upstream DISCONNECTED after %.1fs for req=%s: %s",
+                          time.time() - t0, req_id, err_msg)
+        else:
+            logger.error("Stream error (req=%s): %s", req_id, err_msg, exc_info=True)
+
+        truncated = is_disconnect
+
+        # Flush any content we buffered
         if pending_content:
-            yield _emit_chunk(content=pending_content)
-            full_content += pending_content
+            if not (tools_enabled and _is_potential_tc_text(pending_content)):
+                yield _emit_chunk(content=pending_content)
+                full_content += pending_content
             pending_content = ""
+
+        finish_reason = "stop"
         final = _make_chunk(req_id, created, model)
-        final["choices"][0]["finish_reason"] = "stop"
+        final["choices"][0]["finish_reason"] = finish_reason
         final["choices"][0]["delta"] = {}
         yield _sse_line(final)
         if include_usage:
             yield _usage_chunk(req_id, created, model, _build_usage(prompt, full_content))
         yield "data: [DONE]\n\n"
+
+        # Log the partial content for debugging
+        content_preview = full_content[-200:].replace("\n", "\\n") if full_content else "(none)"
+        logger.info("Stream TRUNCATED req=%s finish=%s tokens=%d elapsed=%.1fs last_chars=%s",
+                    req_id, finish_reason, _estimate_tokens(full_content),
+                    time.time() - t0, content_preview)
         return
 
+    # ---- Normal completion ----
     if pending_content:
         full_content += pending_content
         parsed_tc = tools_enabled and _parse_tool_calls_text(pending_content)
@@ -595,7 +585,7 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
     yield "data: [DONE]\n\n"
 
     elapsed = time.time() - t0
-    content_preview = full_content[:160].replace("\n", "\\n")
+    content_preview = full_content[:160].replace("\n", "\\n") if full_content else "(none)"
     logger.info("Stream done req=%s finish=%s tokens=%d elapsed=%.1fs content=%s",
                 req_id, finish_reason, _estimate_tokens(full_content), elapsed, content_preview)
 
@@ -608,7 +598,7 @@ async def _non_stream_response(sess, body, extra_headers, req_id, created, model
     try:
         async for line in open_stream(sess, QODER_CHAT_URL, body, extra_headers):
             if not line.startswith("data:"): continue
-            delta = _extract_delta_debug(line[5:].strip(), logger)
+            delta = _extract_delta(line[5:].strip())
             if not delta: continue
             if delta.get("content"): full_text += delta["content"]
             if delta.get("tool_calls") and len(delta["tool_calls"]) > 0: tc_acc.append(delta["tool_calls"])
@@ -616,7 +606,13 @@ async def _non_stream_response(sess, body, extra_headers, req_id, created, model
         logger.info("Non-stream cancelled (req=%s)", req_id)
         return JSONResponse(None, status_code=499)
     except Exception as exc:
-        logger.error("Non-stream error (req=%s): %s", req_id, exc, exc_info=True)
+        err_type = type(exc).__name__
+        err_msg = str(exc)[:200]
+        is_disconnect = "peer closed connection" in err_msg or "incomplete chunked" in err_msg
+        if is_disconnect:
+            logger.warning("Qoder upstream DISCONNECTED (non-stream) for req=%s: %s", req_id, err_msg)
+        else:
+            logger.error("Non-stream error (req=%s): %s", req_id, err_msg, exc_info=True)
         errored = True
 
     fallback_tc = None
@@ -638,10 +634,10 @@ async def _non_stream_response(sess, body, extra_headers, req_id, created, model
     usage = _build_usage(prompt, full_text)
 
     elapsed = time.time() - t0
-    content_preview = full_text[:160].replace("\n", "\\n")
-    logger.info("Non-stream done req=%s finish=%s tokens=%d elapsed=%.1f%s content=%s",
-                req_id, finish_reason, usage["total_tokens"], elapsed,
-                " ERR" if errored else "", content_preview)
+    content_preview = full_text[:160].replace("\n", "\\n") if full_text else "(none)"
+    tag = " DISCONNECT" if errored and "peer closed" in str(exc).lower() else (" ERR" if errored else "")
+    logger.info("Non-stream done req=%s finish=%s tokens=%d elapsed=%.1fs%s content=%s",
+                req_id, finish_reason, usage["total_tokens"], elapsed, tag, content_preview)
 
     return JSONResponse({"id": req_id, "object": "chat.completion", "created": created, "model": model,
                           "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],

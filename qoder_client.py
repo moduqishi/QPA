@@ -1,5 +1,6 @@
 """Qoder API client — ported from SignatureApiClient + BearerApiClient + JobTokenClient"""
 
+import asyncio
 import json
 import logging
 import time
@@ -86,7 +87,10 @@ def exchange_job_token(pat: str) -> dict:
     return jt, sess
 
 
-def _build_stream_headers_common(sess: SessionContext, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
+def _build_stream_headers_common(
+    sess: SessionContext,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, str]:
     h = {
         "cosy-data-policy": "AGREE",
         "content-type": "application/json",
@@ -109,7 +113,9 @@ def _build_stream_headers_common(sess: SessionContext, extra_headers: dict[str, 
     return h
 
 
-def _sign_and_auth(sess: SessionContext, url: str, body: str) -> tuple[str, str, str]:
+def _sign_and_auth(
+    sess: SessionContext, url: str, body_str: str
+) -> tuple[str, str, str]:
     from urllib.parse import urlparse
 
     parsed = urlparse(url)
@@ -118,17 +124,26 @@ def _sign_and_auth(sess: SessionContext, url: str, body: str) -> tuple[str, str,
 
     payload_b64 = build_payload_b64(sess.info)
     date = str(int(time.time()))
-    sig = sign_request(payload_b64, sess.cosy_key, date, body, path_sig)
+    sig = sign_request(payload_b64, sess.cosy_key, date, body_str, path_sig)
     bearer = compose_bearer(payload_b64, sig)
     return bearer, date, sig
 
 
-async def open_stream(sess: SessionContext, url: str, body_obj: dict, extra_headers: dict[str, str] | None = None):
+async def open_stream(
+    sess: SessionContext,
+    url: str,
+    body_obj: dict,
+    extra_headers: dict[str, str] | None = None,
+):
     """Async SSE stream — yields raw lines from the Qoder API.
 
-    Uses httpx.AsyncClient with no read timeout so long-reasoning tasks
-    (5+ minutes) are not cut off prematurely.  Raises RuntimeError on
-    non-200 status.
+    Uses httpx.AsyncClient with no read timeout so long-reasoning
+    tasks are not cut off prematurely.
+
+    May raise:
+      RuntimeError — on non-200 HTTP status
+      httpx.RemoteProtocolError — upstream disconnected mid-stream
+      httpx.ReadError — other transport errors
     """
     body = qoder_encode(json.dumps(body_obj).encode())
     bearer, cosy_date, _ = _sign_and_auth(sess, url, body)
@@ -137,14 +152,14 @@ async def open_stream(sess: SessionContext, url: str, body_obj: dict, extra_head
     headers["authorization"] = bearer
     headers["cosy-date"] = cosy_date
 
-    
-    logger.debug("Qoder stream POST %s body_len=%d", url, len(body))
-
-    # read=None: never timeout waiting for the next chunk from the upstream model
+    # read=None: never timeout waiting for the upstream model
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=30, read=None, write=30, pool=30)
+        timeout=httpx.Timeout(connect=30, read=None, write=30, pool=30),
+        limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
     ) as client:
-        async with client.stream("POST", url, content=body, headers=headers) as resp:
+        async with client.stream(
+            "POST", url, content=body, headers=headers
+        ) as resp:
             if resp.status_code != 200:
                 err = await resp.aread()
                 msg = f"Qoder HTTP {resp.status_code} body={err.decode()}"
