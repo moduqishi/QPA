@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 200">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#6c5ce7;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#a29bfe;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <path fill="url(#bg)" d="M0,0 L800,0 L800,200 C750,180 700,160 650,160 C600,160 550,180 500,180 C450,180 400,160 350,160 C300,160 250,180 200,180 C150,180 100,160 50,160 C25,160 10,165 0,170 Z"/>
+  <text x="400" y="70" font-family="system-ui, -apple-system, sans-serif" font-size="80" font-weight="bold" fill="#ffffff" text-anchor="middle">QPA</text>
+  <text x="400" y="110" font-family="system-ui, -apple-system, sans-serif" font-size="18" fill="#ffffff" text-anchor="middle">Qoder Proxy API</text>
+</svg>

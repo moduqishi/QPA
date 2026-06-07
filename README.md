@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://capsule-render.vercel.app/api?type=waving&color=0:6c5ce7,100:a29bfe&height=200&section=header&text=QPA&fontSize=80&fontColor=fff&fontAlignY=35&desc=Qoder%20Proxy%20API&descAlignY=55&descSize=18">
-    <img src="https://capsule-render.vercel.app/api?type=waving&color=0:6c5ce7,100:a29bfe&height=200&section=header&text=QPA&fontSize=80&fontColor=fff&fontAlignY=35&desc=Qoder%20Proxy%20API&descAlignY=55&descSize=18">
-  </picture>
+  <img src="assets/banner.svg" alt="QPA - Qoder Proxy API">
 </p>
 
 <p align="center">
