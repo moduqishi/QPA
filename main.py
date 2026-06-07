@@ -281,20 +281,15 @@ def _convert_openai_contents_to_qoder(message: dict) -> dict:
 
 CODEX_SYSTEM_PROMPT = """You are Codex, a coding agent based on GPT-5. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled.
 
-You are an AI coding assistant with access to tools that let you execute commands, read and edit files, search code, and manage git.
+You have access to tools: exec_command, file readers/writers, search (rg), git, and browser.
 
-# How to work
-1. Understand the request and plan your approach.
-2. Use tools to investigate, build, or edit — never just describe what you would do.
-3. Review tool results and decide next steps.
-4. When done, respond to the user with what you did.
+# Workflow
+1. Understand the task — read files, search, explore.
+2. Do the work — call tools to create, edit, build, test.
+3. When the current step is done, respond to the user with what you did.
+4. Wait for them to continue or give new instructions.
 
-# Guidelines
-- Read files before editing. Use rg (ripgrep) for fast file content searching.
-- Use exec_command for shell/git commands. Use apply_patch for precise code edits.
-- Reference code as file_path:line_number.
-- Keep responses concise. Use GitHub-flavored markdown for formatting.
-- No emojis unless asked.
+Read before you edit. Use rg (not grep) for search. Use apply_patch for code edits. Reference code as `file_path:line_number`.
 
 # Tool format
 Tool calls:
@@ -302,7 +297,7 @@ Tool calls:
 [{"id":"call_1","type":"function","function":{"name":"tool_name","arguments":"{...}"}}]
 ```
 
-Call tools whenever you need information or want to make changes. After each tool result, decide the next action and take it."""
+When you need information or want to make changes, call a tool. After getting results, either continue with the next step, or (when the step is complete) respond to the user."""
 
 _TOOL_DESC_CACHE = "__UNSET__"
 
@@ -661,22 +656,11 @@ async def chat_completions(request: Request):
     # Build the messages array first
     body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls, incoming_tools)
 
-    # chat_context.text is used by Qoder as the model's primary prompt input.
-    # Set it to the FULL system prompt + tool descriptions + current user prompt,
-    # so the model always sees the complete context regardless of how Qoder
-    # handles the messages array vs chat_context fields.
-    chat_context_full = ""
-    for msg in body.get("messages", []):
-        if msg.get("role") == "system":
-            chat_context_full = msg.get("content", "")
-            break
-    if tools_enabled:
-        tool_text = _get_tool_desc(incoming_tools)
-        if tool_text and "[TOOLS]" not in chat_context_full:
-            chat_context_full += "\n\n" + tool_text
-    latest_prompt = prompt or ""
-    if latest_prompt:
-        chat_context_full += "\n\nCurrent request: " + latest_prompt
+    # chat_context.text: This is what Qoder feeds to the model as primary input.
+    # Set to the latest user prompt (the current instruction).
+    # System prompt, tool descriptions, and conversation history are in messages[]
+    # where they belong. chat_context.text is the live task instruction only.
+    chat_context_full = prompt or ""
     if isinstance(ctx.get("text"), dict):
         ctx["text"]["text"] = chat_context_full
     if isinstance(extra.get("originalContent"), dict):
@@ -687,10 +671,14 @@ async def chat_completions(request: Request):
     if image_urls:
         ctx["imageUrls"] = image_urls
 
-    # chatPrompt/chat_prompt: These Qoder-level system fields might override
-    # the messages array system prompt. Leave them empty so Codex's native
-    # system prompt in the messages array is the only instruction.
-    ctx["chatPrompt"] = ""
+    # chatPrompt: Qoder-level behavioral instruction set to a balanced
+    # tool-use and response pattern. messages[] carries the full history.
+    # chat_prompt is kept empty for maximum compatibility.
+    ctx["chatPrompt"] = (
+        "You are a coding assistant. Use available tools to do the work. "
+        "When you complete a step, respond to the user. "
+        "Do not call tools if the task is done just respond."
+    )
     body["chat_prompt"] = ""
 
     if tools_enabled:
