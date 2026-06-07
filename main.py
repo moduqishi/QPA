@@ -108,29 +108,25 @@ def _extract_latest_user_prompt(messages: list[dict]) -> str:
     return ""
 
 def _parse_tool_calls_text(text: str | None) -> list[dict] | None:
-    """Parse 'Tool calls:```json[...]```' from text, allowing extra text after."""
+    """Parse 'Tool calls:```json[...]```' from text, searching anywhere in the text."""
     if not text: return None
-    trimmed = text.strip()
-    if not trimmed.startswith("Tool calls:"): return None
-    payload = trimmed[len("Tool calls:"):].strip()
+    idx = text.find("Tool calls:")
+    if idx < 0: return None
+    payload = text[idx + len("Tool calls:"):].strip()
     # Remove markdown code block markers if present
     if payload.startswith("```"):
         nl = payload.find("\n")
         if nl >= 0:
-            payload = payload[nl + 1:]  # content after the ```json line
+            payload = payload[nl + 1:]
     if payload.endswith("```"):
         payload = payload[:-3].strip()
     elif payload.endswith("```\n") or payload.endswith("``` "):
         payload = payload[:-4].strip()
-    # Also strip markdown variant with text after
     if "\n" in payload:
-        # Take content up to the first ``` or end of JSON array
         end_idx = payload.find("```")
         if end_idx >= 0:
             payload = payload[:end_idx].strip()
         else:
-            # Try to find end of JSON array
-            # Find the last ] that closes the outermost array
             depth = 0
             json_end = -1
             for k, ch in enumerate(payload):
@@ -143,7 +139,6 @@ def _parse_tool_calls_text(text: str | None) -> list[dict] | None:
                         break
             if json_end > 0:
                 payload = payload[:json_end]
-            # else leave as-is and let json.loads decide
     if not payload.startswith("["): return None
     try: return _normalize_tool_calls(json.loads(payload))
     except Exception as e:
@@ -284,39 +279,8 @@ def _convert_openai_contents_to_qoder(message: dict) -> dict:
     return message
 
 
-TOOL_INSTRUCTION = (
-    "You are Codex, an AI coding assistant. ""You have tools available — use them to complete tasks. ""Never just describe what you would do. Call a tool now.\n"
-    "\n"
-    "Key rules:\n"
-    "- Call the right tool immediately. Do not describe plans.\n"
-    "- Read files before editing them. Search with rg (fast), not grep.\n"
-    "- Use exec_command for shell/git/build operations.\n"
-    "- Use apply_patch for precise code edits.\n"
-    "- After changes, verify with tests or runtime checks.\n"
-    "- Keep responses concise. Use markdown for code.\n"
-    "- No emojis unless asked. Respond in the user's language.\n"
-    "- Reference code as `file_path:line_number`.\n"
-    "\n"
-    "Tool call format:\n"
-    "Tool calls:\n```json\n[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"tool_name\",\"arguments\":\"{...}\"}}]\n```\n"
-    "\n"
-    "Call tools continuously until the task is done. "
-    "After each tool result, immediately decide the next action. "
-    "Do not stop to narrate — just do it.\n"
-    "\n"
-    "If you catch yourself starting with \'I will\' or \'Let me\' "
-    "followed by describing actions — stop. Call a tool now."
-)
+TOOL_INSTRUCTION = "You are Codex, an AI assistant. CRITICAL: You MUST call a tool to complete every user request. Never describe what you will do. Never output a plan. Call the appropriate tool immediately.\n\nRules:\n- Call tools NOW. Saying 'I will' or 'Let me' = FAILURE.\n- Read files before editing. Use rg for search (not grep).\n- Use exec_command for shell/git. Use apply_patch for edits.\n- After each tool result, immediately call the next tool.\n\nTool call format:\nTool calls:```json\n[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"tool_name\",\"arguments\":\"{...}\"}}]\n```\n"
 
-
-
-
-
-
-
-
-
-# Cache the tool description text so we don't rebuild it every request
 _TOOL_DESC_CACHE = "__UNSET__"
 
 def _get_tool_desc(incoming_tools: list | None) -> str:
@@ -363,11 +327,8 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
             sys_content += "\n\n" + tool_text
         rebuilt.append({"role": "system", "content": sys_content})
     
-    # Include template system messages if Codex hasn't already provided one.
-    keep_sys = not _has_role(incoming_messages, "system")
-    if keep_sys:
-        for msg in template_messages:
-            if msg.get("role") == "system": rebuilt.append(copy.deepcopy(msg))
+    # Template system messages are not needed — TOOL_INSTRUCTION is already injected.
+    pass
 
     # Track system message content hashes to dedup
     seen_sys = set()
@@ -415,15 +376,16 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
         rebuilt.append(_build_user_message(prompt))
     
     # ---- Truncate long conversations ----
-    # Qwen loses tool-calling ability in contexts >50 messages.
-    # Keep system messages + last 10 turns (model/assistant/user groups).
-    if len(rebuilt) > 15:
+    if len(rebuilt) > 12:
         sys_indices = [j for j, m in enumerate(rebuilt) if m.get("role") == "system"]
         non_sys = [m for j, m in enumerate(rebuilt) if m.get("role") != "system"]
-        keep = non_sys[-10:] if len(non_sys) > 10 else non_sys
+        keep = non_sys[-8:] if len(non_sys) > 8 else non_sys
         truncated = []
-        for j in sys_indices:
-            truncated.append(copy.deepcopy(rebuilt[j]))
+        # Keep only the FIRST system msg (TOOL_INSTRUCTION) and the LAST one
+        if sys_indices:
+            truncated.append(copy.deepcopy(rebuilt[sys_indices[0]]))
+            if len(sys_indices) > 1 and sys_indices[-1] != sys_indices[0]:
+                truncated.append(copy.deepcopy(rebuilt[sys_indices[-1]]))
         if sys_indices and sys_indices[-1] + 1 < len(rebuilt) - len(keep):
             truncated.append({
                 "role": "system",
@@ -474,11 +436,12 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
                 "you are failing. Call a tool now."
             )
             REMINDER_MARKER = "<<TOOL_REMINDER>>"
-            # Dedup: check if we already injected this reminder
+            # Dedup: scan ALL system messages for existing reminder marker
             already = False
-            if last_ui > 0 and rebuilt[last_ui - 1].get("role") == "system":
-                if REMINDER_MARKER in str(rebuilt[last_ui - 1].get("content", "")):
+            for msg in rebuilt:
+                if msg.get("role") == "system" and REMINDER_MARKER in str(msg.get("content", "")):
                     already = True
+                    break
             if not already:
                 rebuilt.insert(last_ui, {
                     "role": "system",
@@ -489,6 +452,7 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
 
 
 def _extract_delta(data_line: str) -> dict:
+    """Parse Qoder SSE chunk, return delta dict with role/content/reasoning/tool_calls/finish_reason."""
     try:
         wrapper = json.loads(data_line)
         inner = wrapper.get("body", "")
@@ -499,12 +463,19 @@ def _extract_delta(data_line: str) -> dict:
         inner_json = json.loads(inner) if isinstance(inner, str) else inner
         for ch in inner_json.get("choices", []):
             delta = ch.get("delta", {})
+            finish = ch.get("finish_reason")
             role = delta.get("role", "")
             content = delta.get("content", "")
             reasoning = delta.get("reasoning_content", "")
             tc = delta.get("tool_calls")
-            if role or content or reasoning or (tc and len(tc) > 0):
-                return {"role": role, "content": content, "reasoning_content": reasoning, "tool_calls": tc}
+            result = {}
+            if role: result["role"] = role
+            if content: result["content"] = content
+            if reasoning: result["reasoning_content"] = reasoning
+            if tc and len(tc) > 0: result["tool_calls"] = tc
+            if finish: result["finish_reason"] = finish
+            if result or finish:
+                return result
     except Exception:
         pass
     return {}
@@ -614,9 +585,9 @@ async def chat_completions(request: Request):
 
     mc = body.get("model_config", {})
     mc["key"] = model
-    mc["max_input_tokens"] = 180000
+    mc["max_input_tokens"] = 100000
     mc["context_config"] = {
-        "180K": {"token_count": 180_000, "is_default": True},
+        "100K": {"token_count": 100_000, "is_default": True},
     }
     if image_urls:
         mc["is_vl"] = True
@@ -629,7 +600,7 @@ async def chat_completions(request: Request):
             mc[p] = req[p]
 
     params = body.get("parameters", {})
-    params["context_length"] = 180000
+    params["context_length"] = 100000
     if "tool_choice" in req:
         params["tool_choice"] = req["tool_choice"]
     if "parallel_tool_calls" in req:
