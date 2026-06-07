@@ -341,11 +341,11 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
     
     Key design choices:
     - Let Codex's original system prompt flow through unchanged.
+    - Inject tool descriptions into the LAST user message text.
+      This is critical for Qwen: it needs to see tool names/descriptions
+      RIGHT BEFORE it decides to respond.  Putting it in the system prompt
+      is not enough — Qoder may truncate or de-prioritize system messages.
     - Do NOT inject QPA's own system prompts or reminders.
-    - If no system message from Codex and tools are enabled,
-      inject CODEX_SYSTEM_PROMPT + tool descriptions as fallback.
-    - Tool descriptions are appended to the first system message
-      as a reference, not as a replacement.
     - Tool role messages are converted to user messages (Qoder
       does not support the tool role).
     - Long conversations are truncated to prevent Qoder upstream
@@ -354,8 +354,7 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
     rebuilt: list[dict] = []
     seen_sys: set[str] = set()
 
-    # ---- First pass: collect all unique system messages from incoming request ----
-    # Codex always sends its own system prompt. We let it through.
+    # ---- First pass: collect unique system messages from incoming request ----
     for message in incoming_messages:
         if message.get("role") == "system":
             mc = message.get("content", "")
@@ -373,10 +372,10 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
         rebuilt.insert(0, {"role": "system", "content": sys_content})
         seen_sys.add(sys_content)
 
-    # ---- Second pass: process remaining (non-system) messages ----
+    # ---- Second pass: process non-system messages ----
     for i, message in enumerate(incoming_messages):
         if message.get("role") == "system":
-            continue  # already handled above
+            continue
 
         allow = tools_enabled and _has_resolved_tool_response(incoming_messages, i)
         converted_msg = _convert_openai_contents_to_qoder(message)
@@ -408,25 +407,36 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
     if not rebuilt and prompt.strip():
         rebuilt.append(_build_user_message(prompt))
 
-    # ---- Append tool descriptions to the first system message as reference ----
-    if tools_enabled and rebuilt and rebuilt[0].get("role") == "system":
-        # Check if tool desc is already present
-        existing = rebuilt[0].get("content", "")
-        has_tool_list = "[TOOLS]" in existing or "[AVAILABLE TOOLS]" in existing
-        if not has_tool_list:
-            tool_text = _get_tool_desc(incoming_tools)
-            if tool_text:
-                rebuilt[0]["content"] = existing + "\n\n" + tool_text
+    # ---- Inject tool descriptions into the LAST user message ----
+    # This is critical: Qwen needs to see tool names RIGHT at the decision point.
+    # The body["tools"] field may not be surfaced to the model by Qoder's API layer,
+    # so we put the descriptions into visible message text.
+    if tools_enabled and len(rebuilt) >= 2:
+        tool_text = _get_tool_desc(incoming_tools)
+        if tool_text:
+            for j in range(len(rebuilt) - 1, -1, -1):
+                if rebuilt[j].get("role") == "user":
+                    existing = rebuilt[j].get("content", "")
+                    if "[TOOLS]" not in existing and "[AVAILABLE TOOLS]" not in existing:
+                        enriched = existing + "\n\n" + tool_text
+                        rebuilt[j]["content"] = enriched
+                        # Also update contents if it exists (Qoder's dual-field format)
+                        contents = rebuilt[j].get("contents")
+                        if isinstance(contents, list):
+                            for c in contents:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    c["text"] = enriched
+                                    break
+                    break
 
     # ---- Truncate long conversations ----
     # Qoder upstream has a ~66s gateway timeout. Long contexts increase
-    # generation latency and hit this limit. We truncate aggressively:
-    # keep first system message + last 8 non-system messages.
-    truncation_threshold = 14
-    if len(rebuilt) > truncation_threshold:
+    # generation latency and hit this limit. Keep first system message
+    # + last 6 non-system messages (aggressive truncation).
+    if len(rebuilt) > 12:
         sys_indices = [j for j, m in enumerate(rebuilt) if m.get("role") == "system"]
         non_sys = [m for j, m in enumerate(rebuilt) if m.get("role") != "system"]
-        keep = non_sys[-8:] if len(non_sys) > 8 else non_sys
+        keep = non_sys[-6:] if len(non_sys) > 6 else non_sys
         truncated = []
         if sys_indices:
             truncated.append(copy.deepcopy(rebuilt[sys_indices[0]]))
@@ -442,14 +452,24 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
 
 
 def _extract_delta(data_line: str) -> dict:
-    """Parse Qoder SSE chunk, return delta dict with role/content/reasoning/tool_calls/finish_reason."""
+    """Parse Qoder SSE chunk, return delta dict with role/content/reasoning/tool_calls/finish_reason.
+
+    Qoder wraps every SSE message in an HTTP envelope:
+      {"headers":{...},"body":"<json>","statusCodeValue":200,"statusCode":"OK"}
+
+    The body field contains the OpenAI-format delta JSON string.
+    The [DONE] signal comes as body="[DONE]" inside this envelope.
+    """
     try:
         wrapper = json.loads(data_line)
         inner = wrapper.get("body", "")
         if not inner:
             return {}
-        if isinstance(inner, str) and inner.strip() == "[DONE]":
-            return {}
+        # Handle [DONE] in envelope format BEFORE JSON-parsing the inner body.
+        # inner is the raw string from the JSON envelope — "[DONE]" (with quotes).
+        # json.loads of the full wrapper gives inner = '[DONE]' (unquoted string).
+        if isinstance(inner, str) and inner.strip() in ("[DONE]", '"[DONE]"'):
+            return {"_done": True}
         inner_json = json.loads(inner) if isinstance(inner, str) else inner
         for ch in inner_json.get("choices", []):
             delta = ch.get("delta", {})
@@ -641,18 +661,13 @@ async def chat_completions(request: Request):
     incoming_tools = req.get("tools")
     tools_enabled = isinstance(incoming_tools, list) and len(incoming_tools) > 0
 
-    # chatPrompt: Qoder-level system field. Set to a clear tool-use instruction.
-    # This lives at the Qoder body top level, NOT in the messages array, so it
-    # survives any truncation Qoder may apply to the messages array.
+    # chatPrompt/chat_prompt: Leave EMPTY.
+    # These Qoder-level system fields might override the messages array system
+    # prompt.  Setting them interferes with Codex's native system prompt.
+    # The tool-use instructions are in the messages themselves.
     if tools_enabled:
-        ctx["chatPrompt"] = (
-            "Use available tools to do the work. "
-            "Call tools when you need information or want to make changes."
-        )
-        body["chat_prompt"] = (
-            "Use available tools to do the work. "
-            "Call tools when you need information or want to make changes."
-        )
+        ctx["chatPrompt"] = ""
+        body["chat_prompt"] = ""
     body["messages"] = _build_qoder_messages(body.get("messages", []), processed_messages, prompt, tools_enabled, image_urls, incoming_tools)
     if tools_enabled:
         body["tools"] = copy.deepcopy(incoming_tools)
@@ -848,19 +863,23 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
         else:
             logger.error("Stream error (req=%s): %s", req_id, err_msg, exc_info=True)
 
-        # The pending_buf variable from the try block may hold unflushed content.
-        # It's not available in this except handler, so we just check full_content.
-        # If the stream was empty (no content, no tool calls) and the upstream
-        # disconnected, emit an error event so Codex knows to retry rather than
-        # thinking the task is done.
+        # Try to scan pending_buf for tool calls if we have partial text.
+        # pending_buf may not be defined in this scope, so use full_content.
+        if tools_enabled:
+            parsed_tc = _parse_tool_calls_text(full_content)
+            if parsed_tc:
+                tc_acc.append(parsed_tc)
+
         had_no_output = not emitted_chunk and not full_content and tc_acc.is_empty()
         if had_no_output and is_disconnect:
+            # Emit an error chunk so Codex knows the upstream dropped the connection
             err_chunk = _make_chunk(req_id, created, model)
             err_chunk["error"] = {"message": err_msg[:200], "type": "upstream_disconnect"}
             yield _sse_line(err_chunk)
 
+        finish_reason = "tool_calls" if not tc_acc.is_empty() else "stop"
         final = _make_chunk(req_id, created, model)
-        final["choices"][0]["finish_reason"] = "stop" if not (had_no_output and is_disconnect) else "length"
+        final["choices"][0]["finish_reason"] = finish_reason
         final["choices"][0]["delta"] = {}
         yield _sse_line(final)
         if include_usage:
@@ -869,8 +888,8 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
 
         tag = "DISCONNECT" if is_disconnect else "ERR"
         content_preview = full_content[-200:].replace("\n", "\\n") if full_content else "(none)"
-        logger.info("Stream %s req=%s tokens=%d elapsed=%.1fs content=%s",
-                    tag, req_id, _estimate_tokens(full_content), time.time() - t0, content_preview)
+        logger.info("Stream %s req=%s tokens=%d elapsed=%.1fs finish=%s content=%s",
+                    tag, req_id, _estimate_tokens(full_content), time.time() - t0, finish_reason, content_preview)
         return
 
     # ---- Normal end of stream ----
