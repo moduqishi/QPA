@@ -226,9 +226,7 @@ def _convert_openai_contents_to_qoder(message: dict) -> dict:
                 url = part.get("image_url", {}).get("url", "")
                 qoder_contents.append({"type": "image_url", "image_url": {"url": url}})
 
-    # If we have images, use contents format
     if qoder_contents:
-        # Prepend text as a text content item
         full_text = "\n\n".join(t for t in text_parts if t)
         if full_text:
             qoder_contents.insert(0, {"type": "text", "text": full_text})
@@ -250,10 +248,8 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
 
     for i, message in enumerate(incoming_messages):
         allow = tools_enabled and _has_resolved_tool_response(incoming_messages, i)
-        # Convert multimodal content first
         converted_msg = _convert_openai_contents_to_qoder(message)
 
-        # Check if this message has image contents — must preserve structure
         contents = converted_msg.get("contents") if isinstance(converted_msg.get("contents"), list) else None
         has_images = False
         if contents:
@@ -263,7 +259,6 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
                     break
 
         if has_images and converted_msg.get("role") == "user":
-            # Preserve the contents array with image_url items, bypass normalization
             rebuilt_msg = {
                 "role": "user",
                 "content": "",
@@ -292,9 +287,10 @@ def _extract_delta(data_line: str) -> dict:
             delta = ch.get("delta", {})
             role = delta.get("role", "")
             content = delta.get("content", "")
+            reasoning = delta.get("reasoning_content", "")
             tc = delta.get("tool_calls")
-            if role or content or (tc and len(tc) > 0):
-                return {"role": role, "content": content, "tool_calls": tc}
+            if role or content or reasoning or (tc and len(tc) > 0):
+                return {"role": role, "content": content, "reasoning_content": reasoning, "tool_calls": tc}
     except: pass
     return {}
 
@@ -308,7 +304,6 @@ def _sse_line(data: dict) -> str:
 
 
 def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~4 chars per token for Chinese, ~6 for mixed."""
     return max(1, len(text) // 4)
 
 
@@ -335,6 +330,19 @@ def _build_usage(prompt_text: str, completion_text: str) -> dict:
     return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
 
 
+def _usage_chunk(req_id: str, created: int, model: str, usage: dict) -> str:
+    """Build the final SSE usage chunk for stream_options.include_usage."""
+    chunk = {
+        "id": req_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": usage,
+    }
+    return _sse_line(chunk)
+
+
 # ─── API Endpoints ───
 
 @app.get("/v1/models")
@@ -359,8 +367,8 @@ async def chat_completions(request: Request):
     stream = req.get("stream", False)
     model = req.get("model", "lite")
     messages = req.get("messages", [])
+    include_usage = (req.get("stream_options") or {}).get("include_usage", False) if stream else False
 
-    # Process images
     processed_messages, image_urls = await _process_images(sess, messages)
 
     body = copy.deepcopy(pool._template_base) if pool._template_base else _load_template()
@@ -383,7 +391,6 @@ async def chat_completions(request: Request):
     if image_urls:
         mc["is_vl"] = True
 
-    # Forward key OpenAI parameters to Qoder config
     forwarded_params = {}
     for p in ("temperature", "top_p", "max_tokens"):
         if p in req:
@@ -393,7 +400,6 @@ async def chat_completions(request: Request):
 
     params = body.get("parameters", {})
     params["context_length"] = pool.default_context_length
-    # Forward tool_choice if provided
     if "tool_choice" in req:
         params["tool_choice"] = req["tool_choice"]
 
@@ -408,7 +414,6 @@ async def chat_completions(request: Request):
     if isinstance(extra.get("originalContent"), dict): extra["originalContent"]["text"] = prompt
     biz["name"] = prompt[:30] if len(prompt) > 30 else prompt
 
-    # Set image URLs in chat_context
     if image_urls:
         ctx["imageUrls"] = image_urls
 
@@ -423,7 +428,7 @@ async def chat_completions(request: Request):
 
     if stream:
         return StreamingResponse(
-            _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt),
+            _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, include_usage),
             media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
     else:
         return await _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt)
@@ -441,12 +446,8 @@ def _load_template() -> dict:
     raise FileNotFoundError("baseprompt.json not found")
 
 
-async def _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt):
-    """Async SSE streaming response with error resilience.
-    
-    NOTE: reasoning_content is intentionally NOT forwarded to avoid 
-    confusing downstream clients (Codex may not handle this non-standard field).
-    """
+async def _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt, include_usage):
+    """Async SSE streaming response — OpenAI-compatible with optional usage."""
     tc_acc = ToolCallAccumulator()
     pending_content = ""
     pending_role = "assistant"
@@ -520,13 +521,14 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
             full_content += pending_content
             pending_content = ""
         final = _make_chunk(req_id, created, model)
-        final["choices"][0]["finish_reason"] = "error"
+        final["choices"][0]["finish_reason"] = "stop"
         final["choices"][0]["delta"] = {}
         yield _sse_line(final)
+        if include_usage:
+            yield _usage_chunk(req_id, created, model, _build_usage(prompt, full_content))
         yield "data: [DONE]\n\n"
         return
 
-    # ---- normal stream end ----
     if pending_content:
         full_content += pending_content
         parsed_tc = tools_enabled and _parse_tool_calls_text(pending_content)
@@ -541,11 +543,12 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
     final["choices"][0]["finish_reason"] = finish_reason
     final["choices"][0]["delta"] = {}
     yield _sse_line(final)
+    if include_usage:
+        yield _usage_chunk(req_id, created, model, _build_usage(prompt, full_content))
     yield "data: [DONE]\n\n"
 
 
 async def _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled, prompt):
-    """Non-streaming variant — consumes the full async stream then returns JSON."""
     full_text = ""
     tc_acc = ToolCallAccumulator()
 
@@ -557,7 +560,7 @@ async def _non_stream_response(sess, body, extra_headers, req_id, created, model
             if delta.get("content"): full_text += delta["content"]
             if delta.get("tool_calls") and len(delta["tool_calls"]) > 0: tc_acc.append(delta["tool_calls"])
     except Exception as exc:
-        pass  # Gracefully return whatever we have
+        pass
 
     fallback_tc = None
     if tc_acc.is_empty() and tools_enabled: fallback_tc = _parse_tool_calls_text(full_text)
