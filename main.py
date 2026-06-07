@@ -761,9 +761,18 @@ async def chat_completions(request: Request):
 
     prompt = _extract_latest_user_prompt(processed_messages)
     ctx = body.get("chat_context", {})
-    if isinstance(ctx.get("text"), dict): ctx["text"]["text"] = prompt
+    # Set chat_context to the FIRST user message (the original task), not the
+    # latest one-liner. This preserves task context across rounds. If Qoder
+    # uses these fields as model input, the model still knows the original task.
+    first_prompt = ""
+    for msg in processed_messages:
+        if msg.get("role") == "user":
+            first_prompt = _normalize_message_text(msg)
+            if first_prompt.strip():
+                break
+    if isinstance(ctx.get("text"), dict): ctx["text"]["text"] = first_prompt[:500] if first_prompt else prompt
     extra = ctx.get("extra", {})
-    if isinstance(extra.get("originalContent"), dict): extra["originalContent"]["text"] = prompt
+    if isinstance(extra.get("originalContent"), dict): extra["originalContent"]["text"] = first_prompt[:500] if first_prompt else prompt
     biz["name"] = prompt[:30] if len(prompt) > 30 else prompt
 
     if image_urls:
