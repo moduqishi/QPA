@@ -119,10 +119,11 @@ jobs:
 
       - name: Prepare release assets
         run: |
-          mkdir assets
-          find artifacts -name "*.tar.gz" -exec mv {} assets/ \;
-          find artifacts -name "*.zip" -exec mv {} assets/ \;
-          ls -la assets/
+          # Use a separate staging dir to avoid conflict with the repo's assets/ dir
+          mkdir -p dist-assets
+          find artifacts -name "*.tar.gz" -exec mv {} dist-assets/ \;
+          find artifacts -name "*.zip" -exec mv {} dist-assets/ \;
+          ls -la dist-assets/
 
       - name: Get version
         id: version
@@ -135,6 +136,6 @@ jobs:
           name: QPA ${{ steps.version.outputs.version }}
           prerelease: true
           generate_release_notes: true
-          files: assets/*
+          files: dist-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

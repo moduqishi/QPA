@@ -1,5 +1,6 @@
 """QPA — Qoder2API FastAPI bridge with PAT pool, image support, and WebUI"""
 
+import asyncio
 import base64
 import copy
 import json
@@ -25,6 +26,11 @@ QODER_CHAT_URL = (
     "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
 )
 
+# ── SSE keepalive interval (seconds) ──────────────────────────────────
+# Ensures the connection stays alive through proxies even when the
+# upstream model is silently reasoning for a long time.
+_SSE_KEEPALIVE_INTERVAL = 25
+
 
 @app.on_event("startup")
 async def startup():
@@ -32,7 +38,6 @@ async def startup():
     pool = PatPool()
     pool._template_base = _load_template()
     pool.init_all()
-
 
 
 async def _process_images(sess: SessionContext, messages: list[dict]) -> tuple[list[dict], list[str]]:
@@ -304,8 +309,14 @@ def _make_chunk(req_id: str, created: int, model: str) -> dict:
     return {"id": req_id, "object": "chat.completion.chunk", "created": created, "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": None}]}
 
+
 def _sse_line(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _sse_keepalive() -> str:
+    """SSE comment line — keeps the connection alive through proxies."""
+    return ": keepalive\n\n"
 
 
 class ToolCallAccumulator:
@@ -323,6 +334,22 @@ class ToolCallAccumulator:
             if df.get("arguments"): ex["function"]["arguments"] += df["arguments"]
     def is_empty(self) -> bool: return not self.calls
     def snapshot(self) -> list[dict]: return copy.deepcopy(self.calls)
+
+
+async def _heartbeat_wrap(async_iter, interval: float = _SSE_KEEPALIVE_INTERVAL):
+    """Wrap an async iterator, yielding ``None`` on heartbeat timeout.
+
+    The consumer sends a keepalive comment whenever ``None`` is yielded.
+    """
+    it = async_iter.__aiter__()
+    while True:
+        try:
+            item = await asyncio.wait_for(it.__anext__(), timeout=interval)
+            yield item
+        except asyncio.TimeoutError:
+            yield None
+        except StopAsyncIteration:
+            break
 
 
 # ─── API Endpoints ───
@@ -405,7 +432,7 @@ async def chat_completions(request: Request):
             _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled),
             media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
     else:
-        return _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled)
+        return await _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled)
 
 
 def _load_template() -> dict:
@@ -424,6 +451,7 @@ def _load_template() -> dict:
 
 
 async def _stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled):
+    """Async SSE streaming response with keepalive and error resilience."""
     tc_acc = ToolCallAccumulator()
     pending_content = ""
     pending_role = "assistant"
@@ -452,46 +480,69 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
         if tc: delta["tool_calls"] = tc
         return _sse_line(chunk)
 
-    for line in open_stream(sess, QODER_CHAT_URL, body, extra_headers):
-        if not line.startswith("data:"): continue
-        delta = _extract_delta(line[5:].strip())
-        if not delta: continue
+    try:
+        async for raw_item in _heartbeat_wrap(open_stream(sess, QODER_CHAT_URL, body, extra_headers)):
+            # Heartbeat — keep connection alive
+            if raw_item is None:
+                yield _sse_keepalive()
+                continue
 
-        d_role, d_content, d_reasoning = delta.get("role", ""), delta.get("content", ""), delta.get("reasoning_content", "")
-        d_tc = delta.get("tool_calls")
+            line = raw_item
+            if not line.startswith("data:"): continue
+            delta = _extract_delta(line[5:].strip())
+            if not delta: continue
 
-        if d_role: pending_role = d_role
-        if d_tc and len(d_tc) > 0:
-            if pending_content:
-                if not (tools_enabled and _is_potential_tc_text(pending_content)):
-                    streaming_text = True
-                    yield _emit_chunk(content=pending_content, role=pending_role if not emitted_chunk else None)
-                    emitted_chunk = True
-                pending_content = ""
-            tc_acc.append(d_tc)
-            yield _emit_chunk(role=pending_role if not emitted_chunk else None, tc=_with_tc_indices(d_tc))
-            emitted_chunk = True
-            continue
+            d_role, d_content, d_reasoning = delta.get("role", ""), delta.get("content", ""), delta.get("reasoning_content", "")
+            d_tc = delta.get("tool_calls")
 
-        if d_reasoning:
-            yield _emit_chunk(role=pending_role if not emitted_chunk else None, reasoning=d_reasoning)
-            emitted_chunk = True
-            continue
+            if d_role: pending_role = d_role
+            if d_tc and len(d_tc) > 0:
+                if pending_content:
+                    if not (tools_enabled and _is_potential_tc_text(pending_content)):
+                        streaming_text = True
+                        yield _emit_chunk(content=pending_content, role=pending_role if not emitted_chunk else None)
+                        emitted_chunk = True
+                    pending_content = ""
+                tc_acc.append(d_tc)
+                yield _emit_chunk(role=pending_role if not emitted_chunk else None, tc=_with_tc_indices(d_tc))
+                emitted_chunk = True
+                continue
 
-        if not d_content: continue
-        if not tools_enabled or streaming_text:
+            if d_reasoning:
+                yield _emit_chunk(role=pending_role if not emitted_chunk else None, reasoning=d_reasoning)
+                emitted_chunk = True
+                continue
+
+            if not d_content: continue
+            if not tools_enabled or streaming_text:
+                streaming_text = True
+                yield _emit_chunk(content=d_content, role=pending_role if not emitted_chunk else None)
+                emitted_chunk = True
+                continue
+
+            pending_content += d_content
+            if _is_potential_tc_text(pending_content): continue
             streaming_text = True
-            yield _emit_chunk(content=d_content, role=pending_role if not emitted_chunk else None)
+            yield _emit_chunk(content=pending_content, role=pending_role if not emitted_chunk else None)
             emitted_chunk = True
-            continue
+            pending_content = ""
 
-        pending_content += d_content
-        if _is_potential_tc_text(pending_content): continue
-        streaming_text = True
-        yield _emit_chunk(content=pending_content, role=pending_role if not emitted_chunk else None)
-        emitted_chunk = True
-        pending_content = ""
+    except Exception as exc:
+        # Graceful upstream error — send a final chunk so the client
+        # doesn't see a hanging / truncated connection.
+        err_msg = str(exc)[:200]
+        # Flush any buffered content first
+        if pending_content:
+            yield _emit_chunk(content=pending_content)
+            pending_content = ""
+        final = _make_chunk(req_id, created, model)
+        final["choices"][0]["finish_reason"] = "error"
+        final["choices"][0]["delta"] = {}
+        yield _sse_line(final)
+        yield "data: [DONE]\n\n"
+        return
 
+    # ---- normal stream end ----
     if pending_content:
         parsed_tc = tools_enabled and _parse_tool_calls_text(pending_content)
         if parsed_tc:
@@ -508,18 +559,23 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
     yield "data: [DONE]\n\n"
 
 
-def _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled):
+async def _non_stream_response(sess, body, extra_headers, req_id, created, model, tools_enabled):
+    """Non-streaming variant — consumes the full async stream then returns JSON."""
     full_text = ""
     reasoning_text = ""
     tc_acc = ToolCallAccumulator()
 
-    for line in open_stream(sess, QODER_CHAT_URL, body, extra_headers):
-        if not line.startswith("data:"): continue
-        delta = _extract_delta(line[5:].strip())
-        if not delta: continue
-        if delta.get("content"): full_text += delta["content"]
-        if delta.get("reasoning_content"): reasoning_text += delta["reasoning_content"]
-        if delta.get("tool_calls") and len(delta["tool_calls"]) > 0: tc_acc.append(delta["tool_calls"])
+    try:
+        async for line in open_stream(sess, QODER_CHAT_URL, body, extra_headers):
+            if not line.startswith("data:"): continue
+            delta = _extract_delta(line[5:].strip())
+            if not delta: continue
+            if delta.get("content"): full_text += delta["content"]
+            if delta.get("reasoning_content"): reasoning_text += delta["reasoning_content"]
+            if delta.get("tool_calls") and len(delta["tool_calls"]) > 0: tc_acc.append(delta["tool_calls"])
+    except Exception as exc:
+        # Graceful fallback: return what we have so far
+        err_msg = str(exc)[:200]
 
     fallback_tc = None
     if tc_acc.is_empty() and tools_enabled: fallback_tc = _parse_tool_calls_text(full_text)

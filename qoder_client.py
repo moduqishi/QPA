@@ -83,12 +83,6 @@ def exchange_job_token(pat: str) -> dict:
     return jt, sess
 
 
-def _build_request_headers(sess: SessionContext, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
-    from urllib.parse import urlparse
-
-    return _build_stream_headers_common(sess, extra_headers)
-
-
 def _build_stream_headers_common(sess: SessionContext, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
     h = {
         "cosy-data-policy": "AGREE",
@@ -126,8 +120,13 @@ def _sign_and_auth(sess: SessionContext, url: str, body: str) -> tuple[str, str,
     return bearer, date, sig
 
 
-def open_stream(sess: SessionContext, url: str, body_obj: dict, extra_headers: dict[str, str] | None = None):
-    """Open SSE stream, yields raw lines from the Qoder API."""
+async def open_stream(sess: SessionContext, url: str, body_obj: dict, extra_headers: dict[str, str] | None = None):
+    """Async SSE stream — yields raw lines from the Qoder API.
+
+    Uses httpx.AsyncClient with no read timeout so long-reasoning tasks
+    (5+ minutes) are not cut off prematurely.  Raises RuntimeError on
+    non-200 status.
+    """
     body = qoder_encode(json.dumps(body_obj).encode())
     bearer, cosy_date, _ = _sign_and_auth(sess, url, body)
 
@@ -135,13 +134,14 @@ def open_stream(sess: SessionContext, url: str, body_obj: dict, extra_headers: d
     headers["authorization"] = bearer
     headers["cosy-date"] = cosy_date
 
-    # Use httpx with streaming
-    client = httpx.Client(timeout=httpx.Timeout(connect=15, read=300, write=15, pool=15))
-    with client.stream("POST", url, content=body, headers=headers) as resp:
-        if resp.status_code != 200:
-            err = resp.read()
-            raise RuntimeError(f"HTTP {resp.status_code} body={err.decode()}")
-        for line in resp.iter_lines():
-            if line:
-                yield line
-    client.close()
+    # read=None: never timeout waiting for the next chunk from the upstream model
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=30, read=None, write=30, pool=30)
+    ) as client:
+        async with client.stream("POST", url, content=body, headers=headers) as resp:
+            if resp.status_code != 200:
+                err = await resp.aread()
+                raise RuntimeError(f"HTTP {resp.status_code} body={err.decode()}")
+            async for line in resp.aiter_lines():
+                if line:
+                    yield line
