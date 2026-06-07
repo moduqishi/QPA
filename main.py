@@ -450,46 +450,45 @@ TOOL_INSTRUCTION = (
 
 
 
+# Cache the tool description text so we don't rebuild it every request
+_TOOL_DESC_CACHE = None
+
+def _get_tool_desc(incoming_tools: list | None) -> str:
+    global _TOOL_DESC_CACHE
+    if _TOOL_DESC_CACHE is not None:
+        return _TOOL_DESC_CACHE
+    if not incoming_tools:
+        return ""
+    lines = []
+    for t in incoming_tools:
+        f = t.get("function", {})
+        name = f.get("name", "?")
+        desc = f.get("description", "").split(". ")[0]
+        params = f.get("parameters", {})
+        props = params.get("properties", {}) if isinstance(params, dict) else {}
+        arg_names = ", ".join(props.keys()) if props else ""
+        if arg_names:
+            lines.append(f"  {name}({arg_names}): {desc}")
+        else:
+            lines.append(f"  {name}: {desc}")
+    tool_desc = (
+        "\n[AVAILABLE TOOLS]\n"
+        + "\n".join(lines) + "\n"
+        + "Call via: Tool calls:\n```json\n[{\"id\": \"call_...\", \"type\": \"function\", \"function\": {\"name\": \"TOOL_NAME\", \"arguments\": \"{...}\"}}]\n```\n"
+        "TOOL CALL REQUIRED. DO NOT DESCRIBE — CALL NOW."
+    )
+    _TOOL_DESC_CACHE = tool_desc
+    return tool_desc
+
+
 def _build_qoder_messages(template_messages: list, incoming_messages: list[dict],
                           prompt: str, tools_enabled: bool, image_urls: list[str],
                           incoming_tools: list | None = None) -> list[dict]:
     rebuilt: list[dict] = []
     
-    # Build the tool description text that will be injected into user messages.
-    # Qwen needs tool definitions in visible text — the body["tools"] field may
-    # not be surfaced to the model by Qoder's API layer.
-    tool_desc_text = ""
-    if tools_enabled and incoming_tools:
-        lines = []
-        for t in incoming_tools:
-            f = t.get("function", {})
-            name = f.get("name", "?")
-            desc = f.get("description", "").split(". ")[0]  # first sentence only
-            params = f.get("parameters", {})
-            props = params.get("properties", {}) if isinstance(params, dict) else {}
-            arg_names = ", ".join(props.keys()) if props else ""
-            if arg_names:
-                lines.append(f"  {name}({arg_names}): {desc}")
-            else:
-                lines.append(f"  {name}: {desc}")
-        tool_names = ", ".join(t.get("function", {}).get("name", "?") for t in incoming_tools)
-        tool_desc_text = (
-            "\n[AVAILABLE TOOLS]\n"
-            + "\n".join(lines) + "\n"
-            + "Call them via: Tool calls:\n```json\n[{\"id\": \"call_...\", \"type\": \"function\", \"function\": {\"name\": \"TOOL_NAME\", \"arguments\": \"{...}\"}}]\n```\n"
-            "CRITICAL: Call a tool NOW. Do NOT describe what you will do."
-        )
-    
-    # Always inject tool instruction(s) as the first system message.
-    # This sets the behavior for the entire conversation.
+    # Always inject tool instruction as the first system message.
     if tools_enabled:
         rebuilt.append({"role": "system", "content": TOOL_INSTRUCTION})
-    
-    # Build tool listing for injection into the last user message.
-    # Qwen needs tool definitions in visible text near the decision point.
-    tool_listing_text = ""
-    if tools_enabled and tool_desc_text:
-        tool_listing_text = tool_desc_text
     
     # Include template system messages if Codex hasn't already provided one.
     keep_sys = not _has_role(incoming_messages, "system")
@@ -497,8 +496,23 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
         for msg in template_messages:
             if msg.get("role") == "system": rebuilt.append(copy.deepcopy(msg))
 
+    # Track system message content hashes to dedup
+    seen_sys = set()
+    for msg in rebuilt:
+        if msg.get("role") == "system":
+            seen_sys.add(msg.get("content", ""))
+
     for i, message in enumerate(incoming_messages):
         allow = tools_enabled and _has_resolved_tool_response(incoming_messages, i)
+        
+        # Skip system messages already present in rebuilt (prevents
+        # TOOL_INSTRUCTION from being duplicated every round).
+        if message.get("role") == "system":
+            mc = message.get("content", "")
+            if mc in seen_sys:
+                continue
+            seen_sys.add(mc)
+        
         converted_msg = _convert_openai_contents_to_qoder(message)
 
         contents = converted_msg.get("contents") if isinstance(converted_msg.get("contents"), list) else None
@@ -527,19 +541,40 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
     if not rebuilt and prompt.strip():
         rebuilt.append(_build_user_message(prompt))
     
+    # ---- Truncate long conversations ----
+    # Qwen loses tool-calling ability in contexts >50 messages.
+    # Keep system messages + last 10 turns (model/assistant/user groups).
+    if len(rebuilt) > 25:
+        sys_indices = [j for j, m in enumerate(rebuilt) if m.get("role") == "system"]
+        non_sys = [m for j, m in enumerate(rebuilt) if m.get("role") != "system"]
+        keep = non_sys[-18:] if len(non_sys) > 18 else non_sys
+        truncated = []
+        for j in sys_indices:
+            truncated.append(copy.deepcopy(rebuilt[j]))
+        if sys_indices and sys_indices[-1] + 1 < len(rebuilt) - len(keep):
+            truncated.append({
+                "role": "system",
+                "content": "[Earlier steps omitted. Continue with the current task.]"
+            })
+        truncated.extend(keep)
+        rebuilt = truncated
+    
     # ---- Inject tool definitions into the LAST user message text ----
-    # This is critical: Qwen needs to see tool names/descriptions RIGHT BEFORE
-    # it decides to respond.  Putting it in the last user message guarantees
-    # the model sees it at decision time, no matter how long the conversation.
-    if tools_enabled and tool_listing_text and len(rebuilt) >= 2:
+    # Only inject if the message doesn't already have them (prevents duplicate
+    # accumulation across rounds).
+    if tools_enabled and len(rebuilt) >= 2:
+        tool_text = _get_tool_desc(incoming_tools)
+        if not tool_text:
+            return rebuilt
         for j in range(len(rebuilt) - 1, -1, -1):
             if rebuilt[j].get("role") == "user":
                 msg = rebuilt[j]
                 existing = _normalize_message_text(msg)
-                # Append tool listing into the user message text
-                enriched = existing + "\n\n" + tool_listing_text
+                # Skip if tools already injected (check for [AVAILABLE TOOLS] marker)
+                if "[AVAILABLE TOOLS]" in existing:
+                    break
+                enriched = existing + "\n\n" + tool_text
                 msg["content"] = enriched
-                # Also update contents for Qoder's dual-field format
                 if msg.get("contents") and isinstance(msg["contents"], list):
                     for c in msg["contents"]:
                         if isinstance(c, dict) and c.get("type") == "text":
@@ -802,10 +837,18 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
 
     try:
         pending_buf = ""
+        line_count = 0
         async for line in open_stream(sess, QODER_CHAT_URL, body, extra_headers):
             if not line.startswith("data:"): continue
-            delta = _extract_delta(line[5:].strip())
-            if not delta: continue
+            line_count += 1
+            raw_data = line[5:].strip()
+            # Log first few non-[DONE] chunks to debug Qoder's response format
+            if line_count <= 5 and "[DONE]" not in raw_data:
+                logger.debug("RAW chunk #%d: %.400s", line_count, raw_data)
+            delta = _extract_delta(raw_data)
+            if not delta:
+                logger.debug("_extract_delta returned empty for: %.200s", raw_data)
+                continue
 
             d_role, d_content, d_reasoning = delta.get("role", ""), delta.get("content", ""), delta.get("reasoning_content", "")
             d_tc = delta.get("tool_calls")
@@ -970,10 +1013,18 @@ async def _non_stream_response(sess, body, extra_headers, req_id, created, model
     errored = False
 
     try:
+        line_count = 0
         async for line in open_stream(sess, QODER_CHAT_URL, body, extra_headers):
             if not line.startswith("data:"): continue
-            delta = _extract_delta(line[5:].strip())
-            if not delta: continue
+            line_count += 1
+            raw_data = line[5:].strip()
+            # Log first few non-[DONE] chunks to debug Qoder's response format
+            if line_count <= 5 and "[DONE]" not in raw_data:
+                logger.debug("RAW chunk #%d: %.400s", line_count, raw_data)
+            delta = _extract_delta(raw_data)
+            if not delta:
+                logger.debug("_extract_delta returned empty for: %.200s", raw_data)
+                continue
             if delta.get("content"): full_text += delta["content"]
             if delta.get("tool_calls") and len(delta["tool_calls"]) > 0: tc_acc.append(delta["tool_calls"])
     except asyncio.CancelledError:
