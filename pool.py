@@ -339,7 +339,7 @@ def _warmup_session(sess: SessionContext):
             "messages": [{"role": "user", "content": "ping",
                          "response_meta": {"id": "", "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
                          "reasoning_content_signature": ""}],
-            "parameters": {"max_tokens": 1, "temperature": 0.0, "context_length": 1000000},
+            "parameters": {"max_tokens": 1, "temperature": 0.0, "context_length": 180000},
             "model_config": {"key": "lite", "is_reasoning": False},
             "chat_context": {
                 "chatPrompt": "",

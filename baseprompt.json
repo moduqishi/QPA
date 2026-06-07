@@ -33,7 +33,7 @@
   "version": "3",
   "chat_prompt": "",
   "parameters": {
-    "max_tokens": 65536,
+    "max_tokens": 16384,
     "temperature": 0.1,
     "top_p": 0.1
   },
@@ -51,14 +51,7 @@
     "api_key": "",
     "url": "",
     "source": "system",
-    "max_input_tokens": 900000,
-    "context_config": {
-      "1M": {"token_count": 1000000, "is_default": true},
-      "200K": {"token_count": 200000},
-      "400K": {"token_count": 400000},
-      "900K": {"token_count": 900000}
-    }
-  },
+    "max_input_tokens": 180000},
   "messages": [],
   "tools": [],
   "business": {
