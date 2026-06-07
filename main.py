@@ -451,11 +451,11 @@ TOOL_INSTRUCTION = (
 
 
 # Cache the tool description text so we don't rebuild it every request
-_TOOL_DESC_CACHE = None
+_TOOL_DESC_CACHE = "__UNSET__"
 
 def _get_tool_desc(incoming_tools: list | None) -> str:
     global _TOOL_DESC_CACHE
-    if _TOOL_DESC_CACHE is not None:
+    if _TOOL_DESC_CACHE != "__UNSET__":
         return _TOOL_DESC_CACHE
     if not incoming_tools:
         return ""
@@ -488,7 +488,14 @@ def _build_qoder_messages(template_messages: list, incoming_messages: list[dict]
     
     # Always inject tool instruction as the first system message.
     if tools_enabled:
-        rebuilt.append({"role": "system", "content": TOOL_INSTRUCTION})
+        # Inject tool definitions into the system prompt itself, not just
+        # the last user message.  This ensures tools are visible even if
+        # Qoder truncates the messages array from the end.
+        sys_content = TOOL_INSTRUCTION
+        tool_text = _get_tool_desc(incoming_tools)
+        if tool_text:
+            sys_content += "\n\n" + tool_text
+        rebuilt.append({"role": "system", "content": sys_content})
     
     # Include template system messages if Codex hasn't already provided one.
     keep_sys = not _has_role(incoming_messages, "system")
@@ -702,8 +709,7 @@ async def chat_completions(request: Request):
     body["session_id"] = str(uuid.uuid4())
     body["stream"] = True
     body["aliyun_user_type"] = sess.identity.user_type
-    body["session_type"] = "openai"
-    body["source"] = 2
+
 
     mc = body.get("model_config", {})
     mc["key"] = model
@@ -895,7 +901,7 @@ async def _stream_response(sess, body, extra_headers, req_id, created, model, to
                     tc_mode = True
                     text_before_tc = pending_buf[:tc_idx]
                     after_tc = pending_buf[tc_idx + 11:]
-                elif len(pending_buf) >= 400:
+                elif len(pending_buf) >= 200:
                     full_content += pending_buf
                     yield _emit_chunk(content=pending_buf, role=pending_role if not emitted_chunk else None)
                     emitted_chunk = True
