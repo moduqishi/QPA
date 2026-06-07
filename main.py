@@ -394,17 +394,22 @@ async def chat_completions(request: Request):
     if image_urls:
         mc["is_vl"] = True
 
-    forwarded_params = {}
+    # Forward OpenAI sampling params to Qoder body (both model_config and parameters)
     for p in ("temperature", "top_p", "max_tokens"):
         if p in req:
-            forwarded_params[p] = req[p]
-    if forwarded_params:
-        mc.update(forwarded_params)
+            mc[p] = req[p]
 
     params = body.get("parameters", {})
     params["context_length"] = pool.default_context_length
     if "tool_choice" in req:
         params["tool_choice"] = req["tool_choice"]
+    # Also seed parameters with forwarded values so Qoder doesn't fall back to chat defaults
+    for p in ("temperature", "top_p", "max_tokens"):
+        if p in req:
+            params[p] = req[p]
+        elif p not in params:
+            # Already set from baseprompt template — keep as is
+            pass
 
     biz = body.get("business", {})
     biz["id"] = str(uuid.uuid4())
